@@ -1,0 +1,49 @@
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: je-build-tfrecords
+spec:
+  template:
+    template:
+      spec:
+        taskCount: 1
+        template:
+          spec:
+            containers:
+              - image: gcr.io/PROJECT_ID/je-ingest:latest
+                command: ["python"]
+                args:
+                  - "data/build_tfrecords.py"
+                env:
+                  - name: GOOGLE_CLOUD_PROJECT
+                    value: PROJECT_ID
+                  - name: DB_INSTANCE_CONNECTION_NAME
+                    value: PROJECT_ID:REGION:INSTANCE_NAME
+                  - name: DB_NAME
+                    value: postgres
+                  - name: DB_USER
+                    value: SERVICE_ACCOUNT_EMAIL  # or use DB_USER_SECRET_NAME below
+                  - name: GCS_OUTPUT_URI
+                    value: gs://YOUR_BUCKET/je_data
+                  - name: BUSINESS_ID
+                    value: YOUR_BUSINESS_ID
+                  - name: START_DATE
+                    value: "2023-01-01"
+                  - name: END_DATE
+                    value: "2023-12-31"
+                  - name: SHARD_SIZE
+                    value: "10000"
+                  # Optional secrets instead of plain env vars:
+                  # - name: SECRETS_PROJECT_ID
+                  #   value: PROJECT_ID
+                  # - name: DB_USER_SECRET_NAME
+                  #   value: db-user  # or projects/PROJECT_ID/secrets/db-user/versions/latest
+                  # - name: GCS_OUTPUT_URI_SECRET_NAME
+                  #   value: gcs-output-uri
+                resources:
+                  limits:
+                    cpu: "2"
+                    memory: 4Gi
+            serviceAccountName: SA_NAME@PROJECT_ID.iam.gserviceaccount.com
+            # If using Private IP for Cloud SQL, also configure a VPC connector here.
+

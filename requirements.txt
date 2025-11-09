@@ -1,0 +1,27 @@
+# Core data ingestion (GCP + Postgres)
+cloud-sql-python-connector[pg8000]>=1.5.0
+pg8000>=1.29.8
+SQLAlchemy>=2.0.0,<3.0.0
+google-cloud-storage>=2.14.0
+google-cloud-secret-manager>=2.20.0
+
+# TensorFlow for TFRecord writing and GCS filesystem
+tensorflow>=2.15.0,<2.18.0
+tensorflow-io-gcs-filesystem>=0.34.0
+keras>=3.0.0,<4.0.0
+
+# Tokenizer / NLP
+transformers>=4.43.0,<5.0.0
+tokenizers>=0.15.2
+numpy>=1.24.0
+scann>=1.2.10
+
+# Utilities
+python-dateutil>=2.8.2
+
+# --- Optional (for later model stages; keep commented until needed) ---
+# keras-nlp>=0.12.0
+# tensorflow-text>=2.15.0
+# psycopg2-binary>=2.9.9  # Alternative Postgres driver if not using pg8000
+
+
