@@ -1,0 +1,134 @@
+from __future__ import annotations
+
+import glob
+import os
+from typing import Any, Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+from transformers import AutoTokenizer
+
+from data.text_normalization import normalize_description
+
+
+def build_targets_from_sets(
+    debits: List[int], credits: List[int], max_lines: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    d_len = len(debits)
+    c_len = len(credits)
+    seq_acc = debits + credits
+    seq_side = [0] * d_len + [1] * c_len
+    L = len(seq_acc)
+    Lc = min(L, max_lines)
+
+    target_accounts = np.full((max_lines,), -1, dtype=np.int64)
+    target_sides = np.full((max_lines,), -1, dtype=np.int64)
+    if Lc > 0:
+        target_accounts[:Lc] = np.asarray(seq_acc[:Lc], dtype=np.int64)
+        target_sides[:Lc] = np.asarray(seq_side[:Lc], dtype=np.int64)
+
+    prev_accounts = np.full((max_lines,), -1, dtype=np.int64)
+    prev_sides = np.full((max_lines,), -1, dtype=np.int64)
+    if Lc > 0:
+        prev_accounts[1:Lc] = target_accounts[: Lc - 1]
+        prev_sides[1:Lc] = target_sides[: Lc - 1]
+
+    stop = np.zeros((max_lines,), dtype=np.int64)
+    stop[0 if Lc == 0 else Lc - 1] = 1
+    return prev_accounts, prev_sides, target_accounts, target_sides, stop
+
+
+class ParquetJEDataset(Dataset):
+    def __init__(
+        self,
+        pattern: str,
+        tokenizer_loc: str = "bert-base-multilingual-cased",
+        max_length: int = 128,
+        max_lines: int = 8,
+    ) -> None:
+        self.files: List[str] = sorted(glob.glob(pattern)) if not pattern.startswith("gs://") else [pattern]
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_loc, use_fast=True)
+        self.max_length = int(max_length)
+        self.max_lines = int(max_lines)
+        if not self.files:
+            raise ValueError(f"No Parquet files matched pattern: {pattern}")
+        # For simplicity, read all small shards into a single DataFrame (streaming can be added later)
+        dfs = [pd.read_parquet(p) for p in self.files] if not pattern.startswith("gs://") else [pd.read_parquet(pattern)]
+        self.df = pd.concat(dfs, ignore_index=True)
+
+    def __len__(self) -> int:
+        return int(len(self.df))
+
+    def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        row = self.df.iloc[idx]
+        desc = normalize_description(str(row.get("description", "")))
+        enc = self.tokenizer(
+            desc,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors=None,
+        )
+        input_ids = torch.tensor(enc["input_ids"], dtype=torch.long)
+        attention_mask = torch.tensor(enc["attention_mask"], dtype=torch.long)
+
+        deb = [int(x) for x in (row.get("debit_accounts") or [])]
+        cre = [int(x) for x in (row.get("credit_accounts") or [])]
+        prev_acc, prev_side, tgt_acc, tgt_side, tgt_stop = build_targets_from_sets(deb, cre, self.max_lines)
+
+        features = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "prev_account_idx": torch.tensor(prev_acc, dtype=torch.long),
+            "prev_side_id": torch.tensor(prev_side, dtype=torch.long),
+            # Numeric conditioning vector [8]
+            "cond_numeric": torch.tensor(
+                [
+                    float(row.get("date_year", 0)),
+                    float(row.get("date_month", 0)),
+                    float(row.get("date_day", 0)),
+                    float(row.get("date_dow", 0)),
+                    float(row.get("date_month_sin", 0.0)),
+                    float(row.get("date_month_cos", 0.0)),
+                    float(row.get("date_day_sin", 0.0)),
+                    float(row.get("date_day_cos", 0.0)),
+                ],
+                dtype=torch.float32,
+            ),
+            # For categorical, pass raw strings; hashing can be applied in model or preprocessed later
+            "currency": str(row.get("currency", "")),
+            "journal_entry_type": str(row.get("journal_entry_type", "")),
+        }
+        targets = {
+            "target_account_idx": torch.tensor(tgt_acc, dtype=torch.long),
+            "target_side_id": torch.tensor(tgt_side, dtype=torch.long),
+            "target_stop_id": torch.tensor(tgt_stop, dtype=torch.long),
+        }
+        return features, targets
+
+
+def collate_fn(batch: List[Tuple[Dict[str, Any], Dict[str, Any]]]):
+    feats, targs = zip(*batch)
+    # Stack tensor features; keep strings as list
+    out_feats: Dict[str, Any] = {}
+    out_targs: Dict[str, torch.Tensor] = {}
+
+    def stack_tensor_field(key: str, dtype: torch.dtype):
+        out_feats[key] = torch.stack([f[key] for f in feats]).to(dtype=dtype)
+
+    stack_tensor_field("input_ids", torch.long)
+    stack_tensor_field("attention_mask", torch.long)
+    stack_tensor_field("prev_account_idx", torch.long)
+    stack_tensor_field("prev_side_id", torch.long)
+    out_feats["cond_numeric"] = torch.stack([f["cond_numeric"] for f in feats]).to(dtype=torch.float32)
+    out_feats["currency"] = [f["currency"] for f in feats]
+    out_feats["journal_entry_type"] = [f["journal_entry_type"] for f in feats]
+
+    out_targs["target_account_idx"] = torch.stack([t["target_account_idx"] for t in targs]).to(dtype=torch.long)
+    out_targs["target_side_id"] = torch.stack([t["target_side_id"] for t in targs]).to(dtype=torch.long)
+    out_targs["target_stop_id"] = torch.stack([t["target_stop_id"] for t in targs]).to(dtype=torch.long)
+    return out_feats, out_targs
+
+

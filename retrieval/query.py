@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Query a ScaNN index for nearest neighbor descriptions.
+Query a ScaNN index for nearest neighbor descriptions (PyTorch).
 Given an input description, returns top-k similar journal_entry_ids.
 """
 from __future__ import annotations
@@ -12,8 +12,9 @@ from typing import List
 
 import numpy as np
 import scann
+import torch
 from google.cloud import storage
-from transformers import AutoTokenizer, TFAutoModel
+from transformers import AutoModel, AutoTokenizer
 
 from data.text_normalization import normalize_description
 
@@ -49,25 +50,28 @@ def read_ids_from_gcs(gcs_uri: str) -> List[str]:
 
 def embed_texts(texts: List[str], tokenizer_loc: str, encoder_loc: str, max_length: int, use_cls: bool) -> np.ndarray:
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_loc, use_fast=True)
-    enc = TFAutoModel.from_pretrained(encoder_loc)
+    enc = AutoModel.from_pretrained(encoder_loc).eval()
+    device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu") )
+    enc.to(device)
     norm_texts = [normalize_description(t) for t in texts]
-    batch = tokenizer(norm_texts, padding=True, truncation=True, max_length=max_length, return_tensors="tf")
-    outputs = enc(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], training=False)
-    if use_cls:
-        pooled = outputs.last_hidden_state[:, 0, :]
-    else:
-        mask = np.expand_dims(batch["attention_mask"].numpy().astype(np.float32), -1)
-        summed = np.sum(outputs.last_hidden_state.numpy() * mask, axis=1)
-        denom = np.sum(mask, axis=1) + 1e-6
-        pooled = summed / denom
-    vecs = pooled.numpy().astype(np.float32)
-    # L2 normalize
+    batch = tokenizer(norm_texts, padding=True, truncation=True, max_length=max_length, return_tensors="pt")
+    batch = {k: v.to(device) for k, v in batch.items()}
+    with torch.no_grad():
+        outputs = enc(**batch)
+        if use_cls:
+            pooled = outputs.last_hidden_state[:, 0, :]
+        else:
+            mask = batch["attention_mask"].unsqueeze(-1).to(dtype=outputs.last_hidden_state.dtype)
+            summed = (outputs.last_hidden_state * mask).sum(dim=1)
+            denom = mask.sum(dim=1).clamp_min(1e-6)
+            pooled = summed / denom
+    vecs = pooled.detach().cpu().numpy().astype(np.float32)
     norms = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-8
     return vecs / norms
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Query ScaNN index for nearest descriptions.")
+    parser = argparse.ArgumentParser(description="Query ScaNN index for nearest descriptions (PyTorch)")
     parser.add_argument("--index-dir", type=str, required=True, help="GCS dir of ScaNN index artifacts")
     parser.add_argument("--ids-uri", type=str, required=True, help="GCS URI for ids list")
     parser.add_argument("--tokenizer-loc", type=str, default="bert-base-multilingual-cased")

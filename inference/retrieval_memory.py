@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import io
 import os
-from typing import List, Tuple
+from typing import List
 
 import numpy as np
 import scann
-import tensorflow as tf
+import torch
 from google.cloud import storage
-from transformers import AutoTokenizer, TFAutoModel
+from transformers import AutoModel, AutoTokenizer
 
 from data.text_normalization import normalize_description
 
@@ -38,7 +38,6 @@ def load_ids_from_gcs(ids_uri: str) -> List[str]:
 def load_searcher_from_gcs(index_dir: str) -> scann.ScannSearcher:
 	import tempfile
 	with tempfile.TemporaryDirectory() as tmpdir:
-		# Download all artifacts under index_dir to tmpdir
 		if not index_dir.startswith("gs://"):
 			raise ValueError("index_dir must start with gs://")
 		client = storage.Client()
@@ -51,26 +50,26 @@ def load_searcher_from_gcs(index_dir: str) -> scann.ScannSearcher:
 			local_path = os.path.join(tmpdir, os.path.relpath(blob.name, start=prefix.rstrip("/")))
 			os.makedirs(os.path.dirname(local_path), exist_ok=True)
 			blob.download_to_filename(local_path)
-		# Load searcher
 		searcher = scann.scann_ops_pybind.load_searcher(tmpdir)
 	return searcher
 
 
 def embed_text(text: str, tokenizer_loc: str, encoder_loc: str, max_length: int = 128, use_cls: bool = False) -> np.ndarray:
 	tokenizer = AutoTokenizer.from_pretrained(tokenizer_loc, use_fast=True)
-	encoder = TFAutoModel.from_pretrained(encoder_loc)
+	encoder = AutoModel.from_pretrained(encoder_loc)
+	encoder.eval()
 	desc = normalize_description(text)
-	tok = tokenizer([desc], padding=True, truncation=True, max_length=max_length, return_tensors="tf")
-	outputs = encoder(input_ids=tok["input_ids"], attention_mask=tok["attention_mask"], training=False)
-	if use_cls:
-		pooled = outputs.last_hidden_state[:, 0, :]
-	else:
-		mask = tf.cast(tf.expand_dims(tok["attention_mask"], -1), tf.float32)
-		summed = tf.reduce_sum(outputs.last_hidden_state * mask, axis=1)
-		denom = tf.reduce_sum(mask, axis=1) + 1e-6
-		pooled = summed / denom
-	vec = pooled.numpy().astype(np.float32)[0]
-	# L2 normalize
+	tok = tokenizer([desc], padding=True, truncation=True, max_length=max_length, return_tensors="pt")
+	with torch.no_grad():
+		outputs = encoder(input_ids=tok["input_ids"], attention_mask=tok["attention_mask"])  # type: ignore[arg-type]
+		if use_cls:
+			pooled = outputs.last_hidden_state[:, 0, :]
+		else:
+			mask = tok["attention_mask"].unsqueeze(-1).to(dtype=outputs.last_hidden_state.dtype)
+			summed = (outputs.last_hidden_state * mask).sum(dim=1)
+			denom = mask.sum(dim=1).clamp_min(1e-6)
+			pooled = summed / denom
+		vec = pooled.squeeze(0).cpu().numpy().astype(np.float32)
 	norm = np.linalg.norm(vec) + 1e-8
 	return (vec / norm).astype(np.float32)
 
@@ -85,9 +84,9 @@ def build_retrieval_memory_for_text(
 	max_length: int = 128,
 	use_cls: bool = False,
 	top_k: int = 5,
-) -> tf.Tensor:
+) -> torch.Tensor:
 	"""
-	Returns retrieval memory tensor of shape [K, H_enc] built from the top-k neighbor embeddings.
+	Returns retrieval memory tensor of shape [K, H_enc] built from the top-k neighbor embeddings (PyTorch tensor).
 	"""
 	searcher = load_searcher_from_gcs(index_dir)
 	ids = load_ids_from_gcs(ids_uri)
@@ -96,6 +95,6 @@ def build_retrieval_memory_for_text(
 	neighbors, _ = searcher.search(q, final_num_neighbors=top_k)
 	idxs = neighbors.tolist()
 	mem = all_embs[idxs] if len(idxs) > 0 else all_embs[:0]
-	return tf.convert_to_tensor(mem, dtype=tf.float32)
+	return torch.tensor(mem, dtype=torch.float32)
 
 

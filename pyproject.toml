@@ -8,6 +8,11 @@ dependencies = [
     "numpy>=2.3.4",
     "python-dateutil>=2.9.0.post0",
     "scann>=1.4.2",
-    "tensorflow-io-gcs-filesystem>=0.37.1",
+    "torch>=2.9.0,<2.10.0",
+    "onnx>=1.16.0",
+    "onnxruntime>=1.18.0",
+    "pyarrow>=16.0.0",
+    "pandas>=2.2.0",
+    "gcsfs>=2024.6.0",
     "transformers>=4.57.1",
 ]
