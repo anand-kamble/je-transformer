@@ -1,72 +1,10 @@
 from __future__ import annotations
 
-from typing import Tuple
-
 import keras
 import tensorflow as tf
 from transformers import AutoModel
 
 from models.pointer import PointerLayer
-
-
-class TorchEncoderLayer(keras.layers.Layer):
-    def __init__(self, encoder_loc: str, **kwargs) -> None:
-        super().__init__(trainable=False, **kwargs)
-        self.encoder_loc = encoder_loc
-        self._enc = None
-
-    def build(self, input_shape):
-        """Load model once during build."""
-        import torch
-        from transformers import AutoModel
-        
-        self._enc = AutoModel.from_pretrained(self.encoder_loc)
-        self._enc.eval()
-        self.hidden_size = self._enc.config.hidden_size
-        super().build(input_shape)
-
-    def call(self, inputs: Tuple[tf.Tensor, tf.Tensor]) -> tf.Tensor:
-        input_ids, attention_mask = inputs
-
-        # Define the function OUTSIDE of tf.py_function scope
-        def _forward(ids, mask):
-            import torch
-            with torch.no_grad():
-                t_ids = torch.from_numpy(ids).long()
-                t_mask = torch.from_numpy(mask).long()
-                out = self._enc(input_ids=t_ids, attention_mask=t_mask)
-                return out.last_hidden_state.detach().cpu().numpy().astype("float32")
-
-        # Call tf.py_function - this doesn't execute during graph construction
-        last_hidden = tf.py_function(
-            func=_forward,
-            inp=[input_ids, attention_mask],
-            Tout=tf.float32,
-        )
-        
-        # Set concrete shape - crucial for Keras to trace the graph
-        batch_size = tf.shape(input_ids)[0]
-        seq_len = tf.shape(input_ids)[1]
-        last_hidden.set_shape([None, None, self.hidden_size])
-        
-        return last_hidden
-
-
-class MeanPoolLayer(keras.layers.Layer):
-    """
-    Keras layer for attention-mask-aware mean pooling over sequence dimension.
-    Inputs:
-      - last_hidden_state: [B, L, H]
-      - attention_mask:    [B, L]
-    Returns:
-      - pooled: [B, H]
-    """
-    def call(self, inputs: Tuple[tf.Tensor, tf.Tensor]) -> tf.Tensor:
-        last_hidden_state, attention_mask = inputs
-        mask = tf.cast(tf.expand_dims(attention_mask, -1), tf.float32)  # [B, L, 1]
-        summed = tf.reduce_sum(last_hidden_state * mask, axis=1)        # [B, H]
-        denom = tf.reduce_sum(mask, axis=1) + 1e-6
-        return summed / denom
 
 
 def mean_pool(last_hidden_state: tf.Tensor, attention_mask: tf.Tensor) -> tf.Tensor:
@@ -126,16 +64,16 @@ def build_je_model(
     # Retrieval memory (ANN-retrieved contexts), same "batchless" convention: [K, H]
     retrieval_memory = keras.layers.Input(shape=(hidden_dim,), dtype=tf.float32, name="retrieval_memory")
 
-    # Encoder (PyTorch backbone wrapped for TF graph)
-    torch_encoder = TorchEncoderLayer(encoder_loc, name="torch_encoder")
-    last_hidden = keras.layers.Lambda(lambda xs: torch_encoder(xs), name="torch_encoder_wrapper")(
-        [input_ids, attention_mask]
-    )  # [B, L, Henc]
+    # Encoder (TensorFlow variant)
+    encoder = AutoModel.from_pretrained(encoder_loc)
+    enc_outputs = encoder(input_ids=input_ids, attention_mask=attention_mask)
+    last_hidden = enc_outputs.last_hidden_state  # [B, L, Henc]
     # Debug: encoder output tensor
     print("last_hidden tensor:", last_hidden)
     # Runtime shape print
     last_hidden = keras.layers.Lambda(lambda x: (tf.print("[DBG] last_hidden shape:", tf.shape(x)), x)[1], name="dbg_last_hidden")(last_hidden)
-    enc_pooled = MeanPoolLayer(name="mean_pool")([last_hidden, attention_mask])  # [B, E]
+    # Use a Keras Lambda wrapper for mean pooling to stay within Keras ops
+    enc_pooled = keras.layers.Lambda(lambda xs: mean_pool(xs[0], xs[1]), name="mean_pool")([last_hidden, attention_mask])  # [B, E]
     enc_pooled = keras.layers.Lambda(lambda x: (tf.print("[DBG] enc_pooled shape:", tf.shape(x)), x)[1], name="dbg_enc_pooled")(enc_pooled)
     enc_proj = keras.layers.Dense(hidden_dim, activation="tanh", name="enc_proj")(enc_pooled)  # [B, H]
     enc_proj = keras.layers.Lambda(lambda x: (tf.print("[DBG] enc_proj shape:", tf.shape(x)), x)[1], name="dbg_enc_proj")(enc_proj)
