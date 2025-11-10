@@ -82,7 +82,6 @@ class SetF1Metric:
         pred_sides = side_logits.argmax(dim=-1)  # [B, T]
 
         if target_stop is not None:
-            # first index where target_stop == stop_id, else T
             has_stop = (target_stop == self.stop_id).any(dim=-1)  # [B]
             stop_idx = (target_stop == self.stop_id).int().argmax(dim=-1)  # [B]
         else:
@@ -125,3 +124,124 @@ class SetF1Metric:
         self.tp.zero_()
         self.fp.zero_()
         self.fn.zero_()
+
+
+class SetF1Hungarian:
+    """Set-level F1 using Hungarian matching (via SciPy) on CPU tensors."""
+
+    def __init__(self, stop_id: int = 1) -> None:
+        self.stop_id = stop_id
+        self.tp = 0.0
+        self.fp = 0.0
+        self.fn = 0.0
+
+    @torch.no_grad()
+    def update_state(
+        self,
+        pointer_logits: torch.Tensor,
+        side_logits: torch.Tensor,
+        target_accounts: torch.Tensor,
+        target_sides: torch.Tensor,
+        target_stop: Optional[torch.Tensor] = None,
+    ) -> None:
+        try:
+            from scipy.optimize import linear_sum_assignment  # type: ignore
+        except Exception:
+            return  # silently skip if SciPy unavailable
+
+        B, T, C = pointer_logits.shape
+        for b in range(B):
+            acc = pointer_logits[b].argmax(dim=-1).cpu().numpy().tolist()
+            sid = side_logits[b].argmax(dim=-1).cpu().numpy().tolist()
+            if target_stop is not None:
+                stop_vec = target_stop[b].cpu().numpy().tolist()
+                L = stop_vec.index(self.stop_id) + 1 if self.stop_id in stop_vec else T
+            else:
+                L = T
+            p_pairs = [(int(acc[i]), int(sid[i])) for i in range(L)]
+            t_acc = target_accounts[b].cpu().numpy().tolist()
+            t_sid = target_sides[b].cpu().numpy().tolist()
+            t_pairs = [(int(t_acc[i]), int(t_sid[i])) for i in range(L)]
+            if len(p_pairs) == 0 and len(t_pairs) == 0:
+                continue
+            if len(p_pairs) == 0:
+                self.fn += float(len(t_pairs))
+                continue
+            if len(t_pairs) == 0:
+                self.fp += float(len(p_pairs))
+                continue
+            P = len(p_pairs)
+            Tn = len(t_pairs)
+            cost = torch.ones((P, Tn), dtype=torch.float32).numpy()
+            # zero cost where equal pairs
+            t_map = {}
+            for j, tp in enumerate(t_pairs):
+                t_map.setdefault(tp, []).append(j)
+            for i, pp in enumerate(p_pairs):
+                if pp in t_map:
+                    for j in t_map[pp]:
+                        cost[i, j] = 0.0
+            row_ind, col_ind = linear_sum_assignment(cost)
+            matched = int((cost[row_ind, col_ind] < 0.5).sum())
+            self.tp += float(matched)
+            self.fp += float(P - matched)
+            self.fn += float(Tn - matched)
+
+    @torch.no_grad()
+    def result(self) -> float:
+        precision = self.tp / (self.tp + self.fp + 1e-6)
+        recall = self.tp / (self.tp + self.fn + 1e-6)
+        return float(2.0 * precision * recall / (precision + recall + 1e-6))
+
+    @torch.no_grad()
+    def reset_states(self) -> None:
+        self.tp = self.fp = self.fn = 0.0
+
+
+@torch.no_grad()
+def _pad_to_same_length(tensors: torch.Tensor, fill: float) -> torch.Tensor:
+    # Not used; kept for reference
+    return tensors
+
+
+def flow_aux_loss(
+    pointer_logits: torch.Tensor,
+    side_logits: torch.Tensor,
+    debit_indices: torch.Tensor,
+    debit_weights: torch.Tensor,
+    credit_indices: torch.Tensor,
+    credit_weights: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Align predicted per-side mass over accounts with normalized debit/credit amounts.
+    - pointer_logits: [B, T, C]
+    - side_logits: [B, T, 2]
+    - debit_indices: [B, D] int64 indices into catalog (pad with -1)
+    - debit_weights: [B, D] float (should sum to 1 per row; zeros if no debits)
+    - credit_indices: [B, K] int64 (pad with -1)
+    - credit_weights: [B, K] float (sum to 1 per row; zeros if no credits)
+    Returns mean of per-side MSE across valid rows.
+    """
+    p = torch.softmax(pointer_logits, dim=-1)  # [B, T, C]
+    s = torch.softmax(side_logits, dim=-1)     # [B, T, 2]
+    pred_debit_mass = (s[:, :, 0].unsqueeze(-1) * p).sum(dim=1)   # [B, C]
+    pred_credit_mass = (s[:, :, 1].unsqueeze(-1) * p).sum(dim=1)  # [B, C]
+
+    def side_mse(pred_mass: torch.Tensor, idxs: torch.Tensor, wts: torch.Tensor) -> torch.Tensor:
+        idxs = idxs.clone()
+        mask = (idxs >= 0).to(pred_mass.dtype)
+        idxs_clamped = idxs.clamp_min(0)
+        gathered = torch.gather(pred_mass, 1, idxs_clamped)  # [B, L]
+        sum_g = gathered.sum(dim=-1, keepdim=True) + 1e-8
+        g_norm = torch.where(sum_g > 0, gathered / sum_g, torch.zeros_like(gathered))
+        # Normalize target weights to sum 1 over non-negative indices
+        wts = torch.where(mask > 0, wts, torch.zeros_like(wts))
+        sum_w = wts.sum(dim=-1, keepdim=True) + 1e-8
+        w_norm = torch.where(sum_w > 0, wts / sum_w, torch.zeros_like(wts))
+        mse = ((g_norm - w_norm) ** 2).mean(dim=-1)  # [B]
+        valid = (mask.sum(dim=-1) > 0).to(mse.dtype)
+        return (mse * valid).sum() / (valid.sum() + 1e-6)
+
+    l_d = side_mse(pred_debit_mass, debit_indices, debit_weights)
+    l_c = side_mse(pred_credit_mass, credit_indices, credit_weights)
+    return 0.5 * (l_d + l_c)

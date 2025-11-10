@@ -3,16 +3,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 from typing import Any, Dict
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from transformers import get_cosine_schedule_with_warmup
 
 from models.catalog_encoder import CatalogEncoder
 from models.je_model_torch import JEModel
-from models.losses import (SetF1Metric, coverage_penalty, pointer_loss,
-                           side_loss, stop_loss)
+from models.losses import (SetF1Metric, coverage_penalty, flow_aux_loss,
+                           pointer_loss, side_loss, stop_loss)
 from train.dataset import ParquetJEDataset, collate_fn
 
 
@@ -40,6 +42,16 @@ def build_catalog_embeddings(artifact: Dict[str, Any], emb_dim: int, device: tor
     return embs.to(device=device, dtype=torch.float32)
 
 
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train JE pointer model (PyTorch)")
     parser.add_argument("--parquet-pattern", type=str, required=True, help="gs:// or local glob of Parquet shards")
@@ -54,7 +66,13 @@ def main():
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--use-amp", action="store_true")
     parser.add_argument("--grad-clip", type=float, default=0.0, help="Max grad norm; 0 to disable")
+    parser.add_argument("--flow-weight", type=float, default=0.10)
+    parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+
+    if args.seed:
+        set_seed(int(args.seed))
 
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
 
@@ -65,6 +83,11 @@ def main():
     cat_emb = build_catalog_embeddings(artifact, emb_dim=args.hidden_dim, device=device)
 
     model = JEModel(encoder_loc=args.encoder, hidden_dim=args.hidden_dim, max_lines=args.max_lines, temperature=1.0).to(device)
+    if args.compile and hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model)  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     total_steps = max(1, len(dl) * args.epochs)
@@ -89,6 +112,10 @@ def main():
             target_account_idx = targets["target_account_idx"].to(device)
             target_side_id = targets["target_side_id"].to(device)
             target_stop_id = targets["target_stop_id"].to(device)
+            debit_indices = targets["debit_indices"].to(device)
+            debit_weights = targets["debit_weights"].to(device)
+            credit_indices = targets["credit_indices"].to(device)
+            credit_weights = targets["credit_weights"].to(device)
 
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
@@ -107,7 +134,15 @@ def main():
                 sl = side_loss(outputs["side_logits"], target_side_id, ignore_index=-1)
                 stl = stop_loss(outputs["stop_logits"], target_stop_id, ignore_index=-1)
                 cov = coverage_penalty(outputs["pointer_logits"]) * 0.01
-                total = pl + sl + stl + cov
+                flow = flow_aux_loss(
+                    outputs["pointer_logits"],
+                    outputs["side_logits"],
+                    debit_indices,
+                    debit_weights,
+                    credit_indices,
+                    credit_weights,
+                ) * float(args.flow_weight)
+                total = pl + sl + stl + cov + flow
             scaler.scale(total).backward()
             if args.grad_clip and args.grad_clip > 0:
                 scaler.unscale_(optimizer)
@@ -120,14 +155,24 @@ def main():
 
             if step % 50 == 0:
                 print(
-                    f"step {step} loss={total.item():.4f} ptr={pl.item():.4f} side={sl.item():.4f} stop={stl.item():.4f} cov={cov.item():.4f} setF1={metric_set_f1.result().item():.4f}"
+                    f"step {step} loss={total.item():.4f} ptr={pl.item():.4f} side={sl.item():.4f} stop={stl.item():.4f} cov={cov.item():.4f} flow={flow.item():.4f} setF1={metric_set_f1.result().item():.4f}"
                 )
+        # Save epoch checkpoint (model + optimizer)
+        os.makedirs(args.output_dir, exist_ok=True) if not args.output_dir.startswith("gs://") else None
+        ckpt_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}.pt") if not args.output_dir.startswith("gs://") else f"/tmp/checkpoint_epoch_{epoch+1}.pt"
+        torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict()}, ckpt_path)
+        if args.output_dir.startswith("gs://"):
+            from google.cloud import storage
 
-    # Save checkpoint (state_dict)
-    os.makedirs(args.output_dir, exist_ok=True) if not args.output_dir.startswith("gs://") else None
-    ckpt_path = os.path.join(args.output_dir, "model_state.pt") if not args.output_dir.startswith("gs://") else "/tmp/model_state.pt"
-    torch.save({"model": model.state_dict()}, ckpt_path)
+            client = storage.Client()
+            _, path = args.output_dir.split("gs://", 1)
+            bucket_name, prefix = path.split("/", 1)
+            blob = client.bucket(bucket_name).blob(f"{prefix.rstrip('/')}/checkpoint_epoch_{epoch+1}.pt")
+            blob.upload_from_filename(ckpt_path)
 
+    # Save final
+    ckpt_final = os.path.join(args.output_dir, "model_state.pt") if not args.output_dir.startswith("gs://") else "/tmp/model_state.pt"
+    torch.save({"model": model.state_dict()}, ckpt_final)
     if args.output_dir.startswith("gs://"):
         from google.cloud import storage
 
@@ -135,10 +180,10 @@ def main():
         _, path = args.output_dir.split("gs://", 1)
         bucket_name, prefix = path.split("/", 1)
         blob = client.bucket(bucket_name).blob(f"{prefix.rstrip('/')}/model_state.pt")
-        blob.upload_from_filename(ckpt_path)
+        blob.upload_from_filename(ckpt_final)
         print(f"Uploaded checkpoint to {args.output_dir}")
     else:
-        print(f"Checkpoint written to {ckpt_path}")
+        print(f"Checkpoint written to {ckpt_final}")
 
 
 if __name__ == "__main__":

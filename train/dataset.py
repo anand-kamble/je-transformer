@@ -54,7 +54,6 @@ class ParquetJEDataset(Dataset):
         self.max_lines = int(max_lines)
         if not self.files:
             raise ValueError(f"No Parquet files matched pattern: {pattern}")
-        # For simplicity, read all small shards into a single DataFrame (streaming can be added later)
         dfs = [pd.read_parquet(p) for p in self.files] if not pattern.startswith("gs://") else [pd.read_parquet(pattern)]
         self.df = pd.concat(dfs, ignore_index=True)
 
@@ -78,12 +77,15 @@ class ParquetJEDataset(Dataset):
         cre = [int(x) for x in (row.get("credit_accounts") or [])]
         prev_acc, prev_side, tgt_acc, tgt_side, tgt_stop = build_targets_from_sets(deb, cre, self.max_lines)
 
+        # Flow supervision (optional)
+        debit_weights = row.get("debit_amounts_norm") or []
+        credit_weights = row.get("credit_amounts_norm") or []
+
         features = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "prev_account_idx": torch.tensor(prev_acc, dtype=torch.long),
             "prev_side_id": torch.tensor(prev_side, dtype=torch.long),
-            # Numeric conditioning vector [8]
             "cond_numeric": torch.tensor(
                 [
                     float(row.get("date_year", 0)),
@@ -97,7 +99,6 @@ class ParquetJEDataset(Dataset):
                 ],
                 dtype=torch.float32,
             ),
-            # For categorical, pass raw strings; hashing can be applied in model or preprocessed later
             "currency": str(row.get("currency", "")),
             "journal_entry_type": str(row.get("journal_entry_type", "")),
         }
@@ -105,13 +106,16 @@ class ParquetJEDataset(Dataset):
             "target_account_idx": torch.tensor(tgt_acc, dtype=torch.long),
             "target_side_id": torch.tensor(tgt_side, dtype=torch.long),
             "target_stop_id": torch.tensor(tgt_stop, dtype=torch.long),
+            "debit_indices": torch.tensor(deb, dtype=torch.long) if deb else torch.tensor([], dtype=torch.long),
+            "debit_weights": torch.tensor(debit_weights, dtype=torch.float32) if debit_weights else torch.tensor([], dtype=torch.float32),
+            "credit_indices": torch.tensor(cre, dtype=torch.long) if cre else torch.tensor([], dtype=torch.long),
+            "credit_weights": torch.tensor(credit_weights, dtype=torch.float32) if credit_weights else torch.tensor([], dtype=torch.float32),
         }
         return features, targets
 
 
 def collate_fn(batch: List[Tuple[Dict[str, Any], Dict[str, Any]]]):
     feats, targs = zip(*batch)
-    # Stack tensor features; keep strings as list
     out_feats: Dict[str, Any] = {}
     out_targs: Dict[str, torch.Tensor] = {}
 
@@ -129,6 +133,27 @@ def collate_fn(batch: List[Tuple[Dict[str, Any], Dict[str, Any]]]):
     out_targs["target_account_idx"] = torch.stack([t["target_account_idx"] for t in targs]).to(dtype=torch.long)
     out_targs["target_side_id"] = torch.stack([t["target_side_id"] for t in targs]).to(dtype=torch.long)
     out_targs["target_stop_id"] = torch.stack([t["target_stop_id"] for t in targs]).to(dtype=torch.long)
+
+    # Pad variable-length debit/credit lists to the max length in batch
+    def pad_stack(key: str, fill: float, dtype: torch.dtype) -> torch.Tensor:
+        lists = [t[key] for t in targs]
+        max_len = max((x.numel() for x in lists), default=0)
+        if max_len == 0:
+            return torch.zeros((len(lists), 0), dtype=dtype)
+        out = []
+        for x in lists:
+            if x.numel() < max_len:
+                pad = torch.full((max_len - x.numel(),), fill_value=fill, dtype=dtype)
+                out.append(torch.cat([x.to(dtype), pad], dim=0))
+            else:
+                out.append(x.to(dtype))
+        return torch.stack(out)
+
+    out_targs["debit_indices"] = pad_stack("debit_indices", -1, torch.long)
+    out_targs["debit_weights"] = pad_stack("debit_weights", 0.0, torch.float32)
+    out_targs["credit_indices"] = pad_stack("credit_indices", -1, torch.long)
+    out_targs["credit_weights"] = pad_stack("credit_weights", 0.0, torch.float32)
+
     return out_feats, out_targs
 
 

@@ -10,10 +10,10 @@ import torch
 from data.text_normalization import normalize_description
 from inference.beam_decode import beam_search_decode
 from inference.postprocess import postprocess_candidates
-from models.losses import SetF1Hungarian
-from models.tokenizer import DescriptionTokenizer
 from models.catalog_encoder import CatalogEncoder
-from models.je_model import build_je_model
+from models.je_model_torch import JEModel
+from models.losses import SetF1Metric
+from models.tokenizer import DescriptionTokenizer
 
 
 def load_json_from_uri(uri: str) -> Dict[str, Any]:
@@ -90,14 +90,15 @@ def main():
 	artifact = load_json_from_uri(args.accounts_artifact)
 	cat_emb = build_catalog_embeddings(artifact, emb_dim=args.hidden_dim, device=device)
 
-	model = build_je_model(
+	model = JEModel(
 		encoder_loc=args.encoder,
 		hidden_dim=args.hidden_dim,
 		max_lines=args.max_lines,
 		temperature=1.0,
 	).to(device)
+	model.eval()
 
-	metric_set = SetF1Hungarian()
+	metric_set = SetF1Metric()
 	token_acc_ptr = 0.0
 	token_acc_side = 0.0
 	token_acc_stop = 0.0
@@ -108,8 +109,8 @@ def main():
 
 	import glob
 	paths = sorted(glob.glob(args.parquet_pattern))
-	import pyarrow.parquet as pq
 	import pandas as pd
+	import pyarrow.parquet as pq
 	frames = [pq.read_table(p).to_pandas() for p in paths]
 	df = pd.concat(frames, ignore_index=True)
 
@@ -140,17 +141,17 @@ def main():
 		target_side = tgt_side[:T] + [-1] * (args.max_lines - T)
 		target_stop = [0] * (max(0, T - 1)) + ([1] if T > 0 else [1]) + [0] * (args.max_lines - T)
 
-		outs = model({
-			"input_ids": input_ids,
-			"attention_mask": attention_mask,
-			"prev_account_idx": torch.tensor([prev_acc], dtype=torch.long, device=device),
-			"prev_side_id": torch.tensor([prev_side], dtype=torch.long, device=device),
-			"catalog_embeddings": cat_emb,
-			"retrieval_memory": torch.zeros((1, args.hidden_dim), dtype=torch.float32, device=device),
-			"cond_numeric": cond_numeric,
-			"currency": currency,
-			"journal_entry_type": je_type,
-		})
+		outs = model(
+			input_ids=input_ids,
+			attention_mask=attention_mask,
+			prev_account_idx=torch.tensor([prev_acc], dtype=torch.long, device=device),
+			prev_side_id=torch.tensor([prev_side], dtype=torch.long, device=device),
+			catalog_embeddings=cat_emb,
+			retrieval_memory=torch.zeros((1, args.hidden_dim), dtype=torch.float32, device=device),
+			cond_numeric=cond_numeric,
+			currency=currency,
+			journal_entry_type=je_type,
+		)
 		ptr_pred = outs["pointer_logits"].argmax(dim=-1).detach().cpu().numpy()[0][:T] if T > 0 else []
 		side_pred = outs["side_logits"].argmax(dim=-1).detach().cpu().numpy()[0][:T] if T > 0 else []
 		stop_pred = outs["stop_logits"].argmax(dim=-1).detach().cpu().numpy()[0][:T] if T > 0 else []
@@ -160,7 +161,6 @@ def main():
 			token_acc_stop += float(stop_pred[-1] == 1)
 			cnt_tokens += 1
 
-		# Set-level Hungarian F1
 		metric_set.update_state(
 			outs["pointer_logits"].detach().cpu(),
 			outs["side_logits"].detach().cpu(),
@@ -169,7 +169,6 @@ def main():
 			torch.tensor([target_stop]),
 		)
 
-		# Beam search candidate and probability
 		cands = beam_search_decode(
 			model=model,
 			input_ids=input_ids,
@@ -203,12 +202,8 @@ def main():
 		"token_ptr_acc": float(token_acc_ptr / max(1, cnt_tokens)),
 		"token_side_acc": float(token_acc_side / max(1, cnt_tokens)),
 		"token_stop_acc": float(token_acc_stop / max(1, cnt_tokens)),
-		"set_f1_hungarian": float(metric_set.result()),
-		"calibration": {
-			"ece_raw": ece_raw,
-			"best_temperature": best_T,
-			"ece_best": best_ece,
-		},
+		"set_f1": float(metric_set.result()),
+		"calibration": {"ece_raw": ece_raw, "best_temperature": best_T, "ece_best": best_ece},
 	}
 	with open(args.output_report, "w") as f:
 		json.dump(report, f, indent=2)

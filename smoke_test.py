@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Lightweight project smoke test.
+Lightweight project smoke test (PyTorch).
 
 Runs minimal imports and tiny shape-checked forwards for core components using
 small random tensors. Optional heavy deps (HF models/tokenizers, ScaNN, GCS)
@@ -21,12 +21,8 @@ import sys
 import traceback
 from typing import List
 
-# Ensure KERAS_BACKEND default early in process
-if not os.environ.get("KERAS_BACKEND"):
-    os.environ["KERAS_BACKEND"] = "tensorflow"
-
 import numpy as np
-import tensorflow as tf
+import torch
 
 # Ensure package imports with relative modules (place project parent on sys.path)
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -69,9 +65,9 @@ def test_catalog_encoder() -> None:
 
     encoder = CatalogEncoder(emb_dim=32)
     accounts = {
-        "number": tf.constant(["100-01", "200-02", "300-03"], dtype=tf.string),
-        "name": tf.constant(["Cash", "Accounts Payable", "Revenue"], dtype=tf.string),
-        "nature": tf.constant(["A", "L", "R"], dtype=tf.string),
+        "number": ["100-01", "200-02", "300-03"],
+        "name": ["Cash", "Accounts Payable", "Revenue"],
+        "nature": ["A", "L", "R"],
     }
     embs = encoder(accounts)
     assert embs.shape[-1] == 32
@@ -85,39 +81,35 @@ def test_pointer_layer_and_losses() -> None:
                                side_loss, stop_loss)
     from models.pointer import PointerLayer
 
-    tf.random.set_seed(7)
+    torch.manual_seed(7)
     batch, hidden, catalog = 2, 16, 11
     T = 4
 
     # Pointer layer (single step version)
     layer = PointerLayer(temperature=1.0)
-    dec = tf.random.normal([batch, hidden])
-    cat = tf.random.normal([catalog, hidden])
+    dec = torch.randn(batch, hidden)
+    cat = torch.randn(catalog, hidden)
     logits_bc = layer(dec, cat)  # [B, C]
     assert logits_bc.shape == (batch, catalog)
 
     # Losses over time
-    pointer_logits = tf.random.normal([batch, T, catalog])
-    side_logits = tf.random.normal([batch, T, 2])
-    stop_logits = tf.random.normal([batch, T, 2])
-    target_accounts = tf.convert_to_tensor(
-        [[1, 3, -1, -1], [2, 2, 5, -1]], dtype=tf.int32
-    )
-    target_sides = tf.convert_to_tensor([[0, 1, -1, -1], [1, 0, 1, -1]], dtype=tf.int32)
-    target_stop = tf.convert_to_tensor([[0, 0, 1, 1], [0, 0, 0, 1]], dtype=tf.int32)
+    pointer_logits = torch.randn(batch, T, catalog)
+    side_logits = torch.randn(batch, T, 2)
+    stop_logits = torch.randn(batch, T, 2)
+    target_accounts = torch.tensor([[1, 3, -1, -1], [2, 2, 5, -1]], dtype=torch.long)
+    target_sides = torch.tensor([[0, 1, -1, -1], [1, 0, 1, -1]], dtype=torch.long)
+    target_stop = torch.tensor([[0, 0, 1, 1], [0, 0, 0, 1]], dtype=torch.long)
 
     pl = pointer_loss(pointer_logits, target_accounts)
     sl = side_loss(side_logits, target_sides)
     stl = stop_loss(stop_logits, target_stop)
     cv = coverage_penalty(pointer_logits)
-    assert all(v.shape == () for v in [pl, sl, stl, cv])
+    assert all(v.dim() == 0 for v in [pl, sl, stl, cv])
 
     metric = SetF1Metric()
-    metric.update_state(
-        pointer_logits, side_logits, target_accounts, target_sides, target_stop
-    )
+    metric.update_state(pointer_logits, side_logits, target_accounts, target_sides, target_stop)
     f1 = metric.result()
-    assert f1.shape == ()
+    assert f1.dim() == 0
     _ok("PointerLayer forward, losses, coverage penalty, F1 metric")
 
 
@@ -126,20 +118,10 @@ def test_postprocess() -> None:
     from inference.postprocess import postprocess_candidates
 
     cands = [
-        {
-            "accounts": [1, 2, 2],
-            "sides": [0, 1, 1],
-            "length": 3,
-            "scores": [0.9, 0.8, 0.7],
-        },
+        {"accounts": [1, 2, 2], "sides": [0, 1, 1], "length": 3, "scores": [0.9, 0.8, 0.7]},
         {"accounts": [3, 3], "sides": [0, 0], "length": 2, "scores": [0.6, 0.5]},
-    ]
-    out = postprocess_candidates(
-        cands,
-        duplicate_policy="collapse_unique_pairs",
-        require_both_sides=True,
-        min_lines=2,
-    )
+        ]
+    out = postprocess_candidates(cands, duplicate_policy="collapse_unique_pairs", require_both_sides=True, min_lines=2)
     assert isinstance(out, list) and len(out) >= 1
     _ok("postprocess_candidates with duplicate policy and structural filter")
 
@@ -152,9 +134,7 @@ def test_tokenizer_optional() -> None:
         from models.tokenizer import DescriptionTokenizer
 
         model_name = os.environ.get("HF_MODEL", "bert-base-multilingual-cased")
-        tok = DescriptionTokenizer(
-            model_name_or_path=model_name, max_length=16, use_fast=True
-        )
+        tok = DescriptionTokenizer(model_name_or_path=model_name, max_length=16, use_fast=True)
         out = tok.tokenize_batch(["Hello   world", "Café Corp"])
         assert "input_ids" in out and "attention_mask" in out
         _ok(f"DescriptionTokenizer with model={model_name}")
@@ -163,15 +143,14 @@ def test_tokenizer_optional() -> None:
 
 
 def test_retrieval_imports_optional() -> None:
-    _section("retrieval_memory/build_index imports (optional)")
+    _section("retrieval imports (optional)")
     try:
         import importlib
 
-        importlib.import_module("retrieval.build_index")
         importlib.import_module("inference.retrieval_memory")
-        _ok("Imported retrieval modules")
+        _ok("Imported retrieval module")
     except Exception as e:
-        _skip(f"Retrieval modules not available or heavy deps missing (ScaNN/GCS): {e}")
+        _skip(f"Retrieval module not available or heavy deps missing (ScaNN/GCS): {e}")
 
 
 def test_je_model_optional() -> None:
@@ -179,7 +158,7 @@ def test_je_model_optional() -> None:
     if os.environ.get("SMOKE_ALLOW_HF", "1") != "1":
         return _skip("Set SMOKE_ALLOW_HF=1 to build encoder-backed JE model")
     try:
-        from models.je_model import build_je_model
+        from models.je_model_torch import JEModel
 
         # Tiny shapes for quick forward
         B, L, T = 2, 8, 3
@@ -188,27 +167,20 @@ def test_je_model_optional() -> None:
         K = 5
 
         model_name = os.environ.get("HF_MODEL", "bert-base-multilingual-cased")
-
-        model = build_je_model(
-            encoder_loc=model_name, hidden_dim=H, max_lines=T, temperature=1.0
-        )
+        model = JEModel(encoder_loc=model_name, hidden_dim=H, max_lines=T, temperature=1.0)
 
         inputs = {
-            "input_ids": tf.ones([B, L], dtype=tf.int32),
-            "attention_mask": tf.ones([B, L], dtype=tf.int32),
-            "prev_account_idx": tf.convert_to_tensor(
-                [[-1, 1, 2], [-1, 0, 3]], dtype=tf.int32
-            ),
-            "prev_side_id": tf.convert_to_tensor(
-                [[-1, 0, 1], [-1, 1, 0]], dtype=tf.int32
-            ),
-            "catalog_embeddings": tf.random.normal([C, H], dtype=tf.float32),
-            "retrieval_memory": tf.random.normal([K, H], dtype=tf.float32),
-            "cond_numeric": tf.random.normal([B, 8], dtype=tf.float32),
-            "currency": tf.constant(["USD", "EUR"], dtype=tf.string),
-            "journal_entry_type": tf.constant(["sales", "refund"], dtype=tf.string),
+            "input_ids": torch.ones([B, L], dtype=torch.long),
+            "attention_mask": torch.ones([B, L], dtype=torch.long),
+            "prev_account_idx": torch.tensor([[-1, 1, 2], [-1, 0, 3]], dtype=torch.long),
+            "prev_side_id": torch.tensor([[-1, 0, 1], [-1, 1, 0]], dtype=torch.long),
+            "catalog_embeddings": torch.randn(C, H, dtype=torch.float32),
+            "retrieval_memory": torch.randn(K, H, dtype=torch.float32),
+            "cond_numeric": torch.randn(B, 8, dtype=torch.float32),
+            "currency": ["USD", "EUR"],
+            "journal_entry_type": ["sales", "refund"],
         }
-        outs = model(inputs, training=False)
+        outs = model(**inputs)
         assert set(outs.keys()) == {"pointer_logits", "side_logits", "stop_logits"}
         assert outs["pointer_logits"].shape == (B, T, C)
         assert outs["side_logits"].shape == (B, T, 2)
@@ -219,14 +191,12 @@ def test_je_model_optional() -> None:
 
 
 def main() -> int:
-    print("Running smoke tests for journal_entry_transformer")
-    print(f"- TensorFlow version: {tf.__version__}")
+    print("Running smoke tests for journal_entry_transformer (PyTorch)")
+    print(f"- PyTorch version: {torch.__version__}")
     print(f"- NumPy version: {np.__version__}")
     print(f"- SMOKE_ALLOW_HF={os.environ.get('SMOKE_ALLOW_HF', '1')}")
     if os.environ.get("SMOKE_ALLOW_HF") == "1":
-        print(
-            f"- HF_MODEL={os.environ.get('HF_MODEL', 'hf-internal-testing/tiny-random-bert')}"
-        )
+        print(f"- HF_MODEL={os.environ.get('HF_MODEL', 'hf-internal-testing/tiny-random-bert')}")
 
     failures: List[str] = []
 

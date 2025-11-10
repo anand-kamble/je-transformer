@@ -38,7 +38,7 @@ def build_catalog_embeddings(artifact: Dict[str, Any], emb_dim: int, device: tor
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Export JEModel to ONNX and optionally validate with ONNXRuntime")
+    parser = argparse.ArgumentParser(description="Export JEModel to ONNX and optionally TorchScript")
     parser.add_argument("--output-onnx", type=str, required=True)
     parser.add_argument("--accounts-artifact", type=str, required=True)
     parser.add_argument("--checkpoint", type=str, required=False, help="Optional state_dict checkpoint path or gs://")
@@ -48,6 +48,7 @@ def main():
     parser.add_argument("--max-length", type=int, default=128)
     parser.add_argument("--opset", type=int, default=18)
     parser.add_argument("--validate", action="store_true")
+    parser.add_argument("--torchscript-out", type=str, default=None)
     args = parser.parse_args()
 
     device = torch.device("cpu")
@@ -55,7 +56,6 @@ def main():
     model = JEModel(encoder_loc=args.encoder, hidden_dim=args.hidden_dim, max_lines=args.max_lines, temperature=1.0).to(device)
 
     if args.checkpoint:
-        # load from local or gs://
         if args.checkpoint.startswith("gs://"):
             from google.cloud import storage
 
@@ -73,35 +73,27 @@ def main():
 
     model.eval()
 
-    # Catalog embeddings for export
     artifact = load_json_from_uri(args.accounts_artifact)
     cat_emb = build_catalog_embeddings(artifact, emb_dim=args.hidden_dim, device=device)
 
-    # Dummy inputs (dynamic axes will relax sizes)
     B = 2
     L = args.max_length
     T = args.max_lines
-    C = cat_emb.shape[0]
     input_ids = torch.ones((B, L), dtype=torch.long, device=device)
     attention_mask = torch.ones((B, L), dtype=torch.long, device=device)
     prev_account_idx = torch.full((B, T), -1, dtype=torch.long, device=device)
     prev_side_id = torch.full((B, T), -1, dtype=torch.long, device=device)
     cond_numeric = torch.zeros((B, 8), dtype=torch.float32, device=device)
-    # For ONNX, pass categorical ids as tensors (not strings)
     currency_ids = torch.zeros((B,), dtype=torch.long, device=device)
     type_ids = torch.zeros((B,), dtype=torch.long, device=device)
 
-    # Wrapper for export to map to model signature
     class Wrapper(torch.nn.Module):
         def __init__(self, m: JEModel, cat: torch.Tensor) -> None:
             super().__init__()
             self.m = m
             self.cat = cat
 
-        def forward(
-            self,
-            input_ids, attention_mask, prev_account_idx, prev_side_id, cond_numeric, currency_ids, type_ids
-        ):
+        def forward(self, input_ids, attention_mask, prev_account_idx, prev_side_id, cond_numeric, currency_ids, type_ids):
             out = self.m(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -134,15 +126,7 @@ def main():
         wrapped,
         (input_ids, attention_mask, prev_account_idx, prev_side_id, cond_numeric, currency_ids, type_ids),
         args.output_onnx,
-        input_names=[
-            "input_ids",
-            "attention_mask",
-            "prev_account_idx",
-            "prev_side_id",
-            "cond_numeric",
-            "currency_ids",
-            "type_ids",
-        ],
+        input_names=["input_ids", "attention_mask", "prev_account_idx", "prev_side_id", "cond_numeric", "currency_ids", "type_ids"],
         output_names=["pointer_logits", "side_logits", "stop_logits"],
         dynamic_axes=dynamic_axes,
         opset_version=int(args.opset),
@@ -164,6 +148,11 @@ def main():
             },
         )
         print("ONNXRuntime validation outputs shapes:", [tuple(o.shape) for o in outs])
+
+    if args.torchscript_out:
+        ts = torch.jit.trace(wrapped, (input_ids, attention_mask, prev_account_idx, prev_side_id, cond_numeric, currency_ids, type_ids))
+        ts.save(args.torchscript_out)
+        print(f"TorchScript exported to {args.torchscript_out}")
 
 
 if __name__ == "__main__":
