@@ -4,7 +4,7 @@ import os
 import tempfile
 from typing import List
 
-from ..data.text_normalization import normalize_batch
+from data.text_normalization import normalize_batch
 
 
 class DescriptionTokenizer:

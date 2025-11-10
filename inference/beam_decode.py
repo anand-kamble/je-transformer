@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import tensorflow as tf
 
-from .retrieval_memory import build_retrieval_memory_for_text
+from inference.retrieval_memory import build_retrieval_memory_for_text
 
 
 @dataclass

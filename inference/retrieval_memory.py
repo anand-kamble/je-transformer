@@ -10,7 +10,7 @@ import tensorflow as tf
 from google.cloud import storage
 from transformers import AutoTokenizer, TFAutoModel
 
-from ..data.text_normalization import normalize_description
+from data.text_normalization import normalize_description
 
 
 def _download_gcs_blob(gcs_uri: str) -> bytes:

@@ -15,7 +15,7 @@ import scann
 from google.cloud import storage
 from transformers import AutoTokenizer, TFAutoModel
 
-from ..data.text_normalization import normalize_description
+from data.text_normalization import normalize_description
 
 
 def download_gcs_dir(gcs_dir: str, local_dir: str) -> None:
@@ -85,7 +85,7 @@ def main():
 
         q = embed_texts([args.text], args.tokenizer_loc, args.encoder_loc, args.max_length, args.use_cls)
         neighbors, distances = searcher.search_batched(q, final_num_neighbors=args.top_k)
-        nbr_idx = neighbors[0].tolist()
+        nbr_idx = np.array(neighbors[0]).tolist()
         for rank, idx in enumerate(nbr_idx, 1):
             print(f"{rank}\t{ids[idx]}\t{distances[0][rank-1]}")
 

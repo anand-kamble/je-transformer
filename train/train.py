@@ -10,12 +10,12 @@ import numpy as np
 import tensorflow as tf
 from google.cloud import storage
 
-from ..data.text_normalization import normalize_description
-from ..models.catalog_encoder import CatalogEncoder
-from ..models.je_model import build_je_model
-from ..models.losses import (SetF1Metric, coverage_penalty, pointer_loss,
-                             side_loss, stop_loss)
-from ..models.tokenizer import DescriptionTokenizer
+from data.text_normalization import normalize_description
+from models.catalog_encoder import CatalogEncoder
+from models.je_model import build_je_model
+from models.losses import (SetF1Hungarian, SetF1Metric, coverage_penalty,
+                           flow_aux_loss, pointer_loss, side_loss, stop_loss)
+from models.tokenizer import DescriptionTokenizer
 
 AUTOTUNE = tf.data.AUTOTUNE
 
@@ -115,6 +115,8 @@ def build_dataset(pattern: str, tokenizer: DescriptionTokenizer, max_length: int
 		# Densify varlen
 		ex["debit_accounts"] = tf.cast(tf.sparse.to_dense(ex["debit_accounts"], default_value=-1), tf.int32)
 		ex["credit_accounts"] = tf.cast(tf.sparse.to_dense(ex["credit_accounts"], default_value=-1), tf.int32)
+		ex["debit_amounts_norm"] = tf.sparse.to_dense(ex["debit_amounts_norm"], default_value=0.0)
+		ex["credit_amounts_norm"] = tf.sparse.to_dense(ex["credit_amounts_norm"], default_value=0.0)
 		return ex
 
 	def _map_py(ex):
@@ -166,6 +168,11 @@ def build_dataset(pattern: str, tokenizer: DescriptionTokenizer, max_length: int
 			"target_account_idx": tgt_acc,
 			"target_side_id": tgt_side,
 			"target_stop_id": tgt_stop,
+			# Flow supervision targets
+			"debit_indices": ex["debit_accounts"],
+			"debit_weights": ex["debit_amounts_norm"],
+			"credit_indices": ex["credit_accounts"],
+			"credit_weights": ex["credit_amounts_norm"],
 		}
 		return features, targets
 
@@ -211,7 +218,7 @@ def main():
 	)
 
 	optimizer = keras.optimizers.Adam(learning_rate=2e-4)
-	metric_set_f1 = SetF1Metric()
+	metric_set_f1 = SetF1Hungarian()
 
 	@tf.function
 	def train_step(batch_features, batch_targets):
@@ -234,7 +241,15 @@ def main():
 			sl = side_loss(outputs["side_logits"], batch_targets["target_side_id"], ignore_index=-1)
 			stl = stop_loss(outputs["stop_logits"], batch_targets["target_stop_id"], ignore_index=-1)
 			cov = coverage_penalty(outputs["pointer_logits"])
-			total = pl + sl + stl + 0.01 * cov
+			flow = flow_aux_loss(
+				outputs["pointer_logits"],
+				outputs["side_logits"],
+				batch_targets["debit_indices"],
+				batch_targets["debit_weights"],
+				batch_targets["credit_indices"],
+				batch_targets["credit_weights"],
+			)
+			total = pl + sl + stl + 0.01 * cov + 0.1 * flow
 		grads = tape.gradient(total, model.trainable_variables)
 		optimizer.apply_gradients(zip(grads, model.trainable_variables))
 		metric_set_f1.update_state(
@@ -242,7 +257,7 @@ def main():
 			batch_targets["target_account_idx"], batch_targets["target_side_id"],
 			batch_targets["target_stop_id"],
 		)
-		return {"loss": total, "pointer_loss": pl, "side_loss": sl, "stop_loss": stl, "cov_pen": cov}
+		return {"loss": total, "pointer_loss": pl, "side_loss": sl, "stop_loss": stl, "cov_pen": cov, "flow_loss": flow}
 
 	# Training loop
 	global_step = 0
@@ -275,13 +290,5 @@ def main():
 				blob.upload_from_filename(local_path)
 	else:
 		tf.saved_model.save(model, args.output_dir)
-
-
-if __name__ == "__main__":
-	main()
-
-
-if __name__ == "__main__":
-	main()
 
 

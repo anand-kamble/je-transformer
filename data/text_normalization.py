@@ -2,7 +2,6 @@ import re
 import unicodedata
 from typing import Iterable, List
 
-
 _WS_RE = re.compile(r"\s+")
 
 
@@ -22,5 +21,5 @@ def normalize_description(text: str) -> str:
 
 
 def normalize_batch(texts: Iterable[str]) -> List[str]:
-    return [normalize_description(t) for t in texts]***
+    return [normalize_description(t) for t in texts]
 

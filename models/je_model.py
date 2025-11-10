@@ -1,8 +1,72 @@
 from __future__ import annotations
 
+from typing import Tuple
+
 import keras
 import tensorflow as tf
-from transformers import TFAutoModel
+from transformers import AutoModel
+
+from models.pointer import PointerLayer
+
+
+class TorchEncoderLayer(keras.layers.Layer):
+    def __init__(self, encoder_loc: str, **kwargs) -> None:
+        super().__init__(trainable=False, **kwargs)
+        self.encoder_loc = encoder_loc
+        self._enc = None
+
+    def build(self, input_shape):
+        """Load model once during build."""
+        import torch
+        from transformers import AutoModel
+        
+        self._enc = AutoModel.from_pretrained(self.encoder_loc)
+        self._enc.eval()
+        self.hidden_size = self._enc.config.hidden_size
+        super().build(input_shape)
+
+    def call(self, inputs: Tuple[tf.Tensor, tf.Tensor]) -> tf.Tensor:
+        input_ids, attention_mask = inputs
+
+        # Define the function OUTSIDE of tf.py_function scope
+        def _forward(ids, mask):
+            import torch
+            with torch.no_grad():
+                t_ids = torch.from_numpy(ids).long()
+                t_mask = torch.from_numpy(mask).long()
+                out = self._enc(input_ids=t_ids, attention_mask=t_mask)
+                return out.last_hidden_state.detach().cpu().numpy().astype("float32")
+
+        # Call tf.py_function - this doesn't execute during graph construction
+        last_hidden = tf.py_function(
+            func=_forward,
+            inp=[input_ids, attention_mask],
+            Tout=tf.float32,
+        )
+        
+        # Set concrete shape - crucial for Keras to trace the graph
+        batch_size = tf.shape(input_ids)[0]
+        seq_len = tf.shape(input_ids)[1]
+        last_hidden.set_shape([None, None, self.hidden_size])
+        
+        return last_hidden
+
+
+class MeanPoolLayer(keras.layers.Layer):
+    """
+    Keras layer for attention-mask-aware mean pooling over sequence dimension.
+    Inputs:
+      - last_hidden_state: [B, L, H]
+      - attention_mask:    [B, L]
+    Returns:
+      - pooled: [B, H]
+    """
+    def call(self, inputs: Tuple[tf.Tensor, tf.Tensor]) -> tf.Tensor:
+        last_hidden_state, attention_mask = inputs
+        mask = tf.cast(tf.expand_dims(attention_mask, -1), tf.float32)  # [B, L, 1]
+        summed = tf.reduce_sum(last_hidden_state * mask, axis=1)        # [B, H]
+        denom = tf.reduce_sum(mask, axis=1) + 1e-6
+        return summed / denom
 
 
 def mean_pool(last_hidden_state: tf.Tensor, attention_mask: tf.Tensor) -> tf.Tensor:
@@ -18,6 +82,8 @@ def build_je_model(
     max_lines: int = 8,
     temperature: float = 1.0,
 ) -> keras.Model:
+    # Debug: configuration
+    print("build_je_model config:", {"encoder_loc": encoder_loc, "hidden_dim": hidden_dim, "max_lines": max_lines, "temperature": temperature})
     """
     Keras functional model that:
       - Encodes the description via a pretrained text encoder
@@ -42,6 +108,12 @@ def build_je_model(
     # Text inputs
     input_ids = keras.layers.Input(shape=(None,), dtype=tf.int32, name="input_ids")
     attention_mask = keras.layers.Input(shape=(None,), dtype=tf.int32, name="attention_mask")
+    # Debug: inputs tensors
+    print("input_ids tensor:", input_ids)
+    print("attention_mask tensor:", attention_mask)
+    # Runtime shape prints for inputs
+    input_ids = keras.layers.Lambda(lambda t: (tf.print("[DBG] input_ids shape:", tf.shape(t), "dtype:", t.dtype), t)[1], name="dbg_input_ids")(input_ids)
+    attention_mask = keras.layers.Lambda(lambda t: (tf.print("[DBG] attention_mask shape:", tf.shape(t), "dtype:", t.dtype), t)[1], name="dbg_attention_mask")(attention_mask)
 
     # Decoder teacher forcing inputs
     prev_account_idx = keras.layers.Input(shape=(max_lines,), dtype=tf.int32, name="prev_account_idx")
@@ -54,11 +126,19 @@ def build_je_model(
     # Retrieval memory (ANN-retrieved contexts), same "batchless" convention: [K, H]
     retrieval_memory = keras.layers.Input(shape=(hidden_dim,), dtype=tf.float32, name="retrieval_memory")
 
-    # Encoder
-    encoder = TFAutoModel.from_pretrained(encoder_loc)
-    enc_outputs = encoder(input_ids=input_ids, attention_mask=attention_mask, training=False)
-    enc_pooled = mean_pool(enc_outputs.last_hidden_state, attention_mask)  # [B, E]
+    # Encoder (PyTorch backbone wrapped for TF graph)
+    torch_encoder = TorchEncoderLayer(encoder_loc, name="torch_encoder")
+    last_hidden = keras.layers.Lambda(lambda xs: torch_encoder(xs), name="torch_encoder_wrapper")(
+        [input_ids, attention_mask]
+    )  # [B, L, Henc]
+    # Debug: encoder output tensor
+    print("last_hidden tensor:", last_hidden)
+    # Runtime shape print
+    last_hidden = keras.layers.Lambda(lambda x: (tf.print("[DBG] last_hidden shape:", tf.shape(x)), x)[1], name="dbg_last_hidden")(last_hidden)
+    enc_pooled = MeanPoolLayer(name="mean_pool")([last_hidden, attention_mask])  # [B, E]
+    enc_pooled = keras.layers.Lambda(lambda x: (tf.print("[DBG] enc_pooled shape:", tf.shape(x)), x)[1], name="dbg_enc_pooled")(enc_pooled)
     enc_proj = keras.layers.Dense(hidden_dim, activation="tanh", name="enc_proj")(enc_pooled)  # [B, H]
+    enc_proj = keras.layers.Lambda(lambda x: (tf.print("[DBG] enc_proj shape:", tf.shape(x)), x)[1], name="dbg_enc_proj")(enc_proj)
 
     # -------- Conditioning (date/categorical via FiLM) --------
     # Numeric conditioning features (e.g., year, month, day, dow, sin/cos) packed into a single vector
@@ -66,6 +146,10 @@ def build_je_model(
     # Categorical scalar features as strings
     currency = keras.layers.Input(shape=(), dtype=tf.string, name="currency")
     je_type = keras.layers.Input(shape=(), dtype=tf.string, name="journal_entry_type")
+    # Debug conditioning inputs
+    cond_numeric = keras.layers.Lambda(lambda t: (tf.print("[DBG] cond_numeric shape:", tf.shape(t)), t)[1], name="dbg_cond_numeric")(cond_numeric)
+    currency = keras.layers.Lambda(lambda t: (tf.print("[DBG] currency shape:", tf.shape(t)), t)[1], name="dbg_currency")(currency)
+    je_type = keras.layers.Lambda(lambda t: (tf.print("[DBG] je_type shape:", tf.shape(t)), t)[1], name="dbg_je_type")(je_type)
 
     # Hash -> Embedding for categorical strings
     def hash_bucket(x, buckets):
@@ -82,11 +166,14 @@ def build_je_model(
     cond_num_vec = keras.layers.Dense(max(32, hidden_dim // 4), activation="relu", name="cond_num_mlp")(cond_numeric)
     cond_vec = keras.layers.Concatenate(name="cond_concat")([cond_num_vec, cur_emb, typ_emb])
     cond_vec = keras.layers.Dense(hidden_dim, activation="relu", name="cond_proj")(cond_vec)
+    cond_vec = keras.layers.Lambda(lambda x: (tf.print("[DBG] cond_vec shape:", tf.shape(x)), x)[1], name="dbg_cond_vec")(cond_vec)
 
     # FiLM modulation of encoder projection
     gamma_beta = keras.layers.Dense(2 * hidden_dim, activation=None, name="film_params")(cond_vec)
+    gamma_beta = keras.layers.Lambda(lambda x: (tf.print("[DBG] gamma_beta shape:", tf.shape(x)), x)[1], name="dbg_gamma_beta")(gamma_beta)
     gamma, beta = tf.split(gamma_beta, num_or_size_splits=2, axis=-1)
     enc_ctx = enc_proj * (1.0 + gamma) + beta  # [B, H]
+    enc_ctx = keras.layers.Lambda(lambda x: (tf.print("[DBG] enc_ctx shape:", tf.shape(x)), x)[1], name="dbg_enc_ctx")(enc_ctx)
 
     # Prepare decoder inputs
     # Lookup previous account embedding for teacher forcing (-1 -> zero)
@@ -102,6 +189,7 @@ def build_je_model(
         return gathered * (1.0 - mask) + zeros * mask
 
     prev_acc_emb = keras.layers.Lambda(gather_account_emb, name="gather_prev_acc")(prev_account_idx)
+    prev_acc_emb = keras.layers.Lambda(lambda x: (tf.print("[DBG] prev_acc_emb shape:", tf.shape(x)), x)[1], name="dbg_prev_acc_emb")(prev_acc_emb)
 
     # Side embedding for previous side id (-1 -> zeros)
     side_emb_layer = keras.layers.Embedding(2, hidden_dim, name="prev_side_emb")  # 0,1; BOS -> zeros
@@ -109,19 +197,25 @@ def build_je_model(
     prev_side_emb = side_emb_layer(safe_side)  # [B, T, H]
     side_bos_mask = tf.cast(tf.equal(prev_side_id, -1), tf.float32)
     prev_side_emb = prev_side_emb * tf.expand_dims(1.0 - side_bos_mask, -1)
+    prev_side_emb = keras.layers.Lambda(lambda x: (tf.print("[DBG] prev_side_emb shape:", tf.shape(x)), x)[1], name="dbg_prev_side_emb")(prev_side_emb)
 
     # Repeat encoder context over time and concat
     enc_tiled = tf.tile(tf.expand_dims(enc_ctx, axis=1), [1, max_lines, 1])  # [B, T, H]
     dec_inp = keras.layers.Concatenate(axis=-1)([enc_tiled, prev_acc_emb, prev_side_emb])  # [B, T, 3H]
     dec_inp = keras.layers.Dense(hidden_dim, activation="relu")(dec_inp)  # [B, T, H]
+    enc_tiled = keras.layers.Lambda(lambda x: (tf.print("[DBG] enc_tiled shape:", tf.shape(x)), x)[1], name="dbg_enc_tiled")(enc_tiled)
+    dec_inp = keras.layers.Lambda(lambda x: (tf.print("[DBG] dec_inp shape:", tf.shape(x)), x)[1], name="dbg_dec_inp")(dec_inp)
 
     # Decoder GRU
     gru = keras.layers.GRU(hidden_dim, return_sequences=True, name="decoder_gru")
     dec_h = gru(dec_inp)  # [B, T, H]
+    # Runtime shape print
+    dec_h = keras.layers.Lambda(lambda x: (tf.print("[DBG] dec_h shape:", tf.shape(x)), x)[1], name="dbg_dec_h")(dec_h)
 
     # Project retrieval memory to hidden_dim and attend: dec_h attends over retrieval_memory [K, Henc] -> [K, H]
     retr_mem_proj_layer = keras.layers.Dense(hidden_dim, activation=None, name="retr_mem_proj")
     retr_mem_proj = retr_mem_proj_layer(retrieval_memory)
+    retr_mem_proj = keras.layers.Lambda(lambda x: (tf.print("[DBG] retr_mem_proj shape:", tf.shape(x)), x)[1], name="dbg_retr_mem_proj")(retr_mem_proj)
 
     # Retrieval attention: supports mem shapes [K, H] or [B, K, H]
     def retrieval_attention_fn(inputs):
@@ -152,23 +246,35 @@ def build_je_model(
     retr_ctx = retr_ctx * gate
     dec_h_fused = keras.layers.Concatenate(axis=-1)([dec_h, retr_ctx])  # [B, T, 2H]
     dec_h_fused = keras.layers.Dense(hidden_dim, activation="relu", name="post_retr_proj")(dec_h_fused)  # [B, T, H]
+    retr_ctx = keras.layers.Lambda(lambda x: (tf.print("[DBG] retr_ctx shape:", tf.shape(x)), x)[1], name="dbg_retr_ctx")(retr_ctx)
+    dec_h_fused = keras.layers.Lambda(lambda x: (tf.print("[DBG] dec_h_fused shape:", tf.shape(x)), x)[1], name="dbg_dec_h_fused")(dec_h_fused)
 
-    # Pointer logits over catalog: normalize both and compute dot-product
-    def pointer_logits_fn(inputs):
-        dec_h_, cat_ = inputs  # [B, T, H], [C, H]
-        dec_n = tf.math.l2_normalize(dec_h_, axis=-1)  # [B, T, H]
-        cat_n = tf.math.l2_normalize(cat_, axis=-1)    # [C, H]
-        # [B, T, C] = (B,T,H) x (H,C)
-        logits = tf.einsum("bth,ch->btc", dec_n, cat_n) / max(1e-6, temperature)
-        return logits
-
-    pointer_logits = keras.layers.Lambda(pointer_logits_fn, name="pointer_logits")([dec_h_fused, catalog_embeddings])
+    # Pointer logits over catalog using shared PointerLayer; flatten time then unflatten back
+    pointer_layer = PointerLayer(temperature=temperature, name="pointer_layer")
+    print(pointer_layer)
+    flat_dec = keras.layers.Lambda(lambda x: tf.reshape(x, [-1, hidden_dim]), name="flatten_time")(dec_h_fused)  # [B*T, H]
+    
+    print(type(flat_dec))
+    print(flat_dec.shape)
+    
+    
+    logits_flat = pointer_layer(flat_dec, catalog_embeddings)  # [B*T, C]
+    # Runtime shape print for logits_flat
+    logits_flat = keras.layers.Lambda(lambda x: (tf.print("[DBG] logits_flat shape:", tf.shape(x)), x)[1], name="dbg_logits_flat")(logits_flat)
+    pointer_logits = keras.layers.Lambda(
+        lambda xs: tf.reshape(xs[0], [tf.shape(xs[1])[0], max_lines, tf.shape(xs[2])[0]]),
+        name="unflatten_time",
+    )([logits_flat, dec_h_fused, catalog_embeddings])
+    # Runtime shape print for pointer_logits
+    pointer_logits = keras.layers.Lambda(lambda x: (tf.print("[DBG] pointer_logits shape:", tf.shape(x)), x)[1], name="dbg_pointer_logits")(pointer_logits)
 
     # Side logits
     side_logits = keras.layers.TimeDistributed(keras.layers.Dense(2), name="side_logits")(dec_h_fused)
+    side_logits = keras.layers.Lambda(lambda x: (tf.print("[DBG] side_logits shape:", tf.shape(x)), x)[1], name="dbg_side_logits")(side_logits)
 
     # Stop logits
     stop_logits = keras.layers.TimeDistributed(keras.layers.Dense(2), name="stop_logits")(dec_h_fused)
+    stop_logits = keras.layers.Lambda(lambda x: (tf.print("[DBG] stop_logits shape:", tf.shape(x)), x)[1], name="dbg_stop_logits")(stop_logits)
 
     model = keras.Model(
         inputs=[
@@ -186,4 +292,6 @@ def build_je_model(
         name="JETransformerPointer",
     )
     return model
+
+
 

@@ -18,12 +18,12 @@ import tempfile
 from typing import Dict, List, Tuple
 
 import numpy as np
-import tensorflow as tf
 import scann
+import tensorflow as tf
 from google.cloud import storage
 from transformers import AutoTokenizer, TFAutoModel
 
-from ..data.text_normalization import normalize_description
+from data.text_normalization import normalize_description
 
 
 def parse_example(serialized: tf.Tensor) -> Dict[str, tf.Tensor]:
@@ -136,7 +136,7 @@ def main():
     args = parser.parse_args()
 
     # Dataset
-    raw = build_files_dataset(args.input-pattern, args.num_parallel_reads).map(parse_example, num_parallel_calls=tf.data.AUTOTUNE)
+    raw = build_files_dataset(args.input_pattern, args.num_parallel_reads).map(parse_example, num_parallel_calls=tf.data.AUTOTUNE)
     raw = raw.map(
         lambda ex: {
             "journal_entry_id": ex["journal_entry_id"],

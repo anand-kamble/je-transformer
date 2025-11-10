@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import keras
 import tensorflow as tf
 
 
-class CatalogEncoder(tf.keras.layers.Layer):
+class CatalogEncoder(keras.layers.Layer):
     """
     Money-flow-aware account encoder (lightweight, hash-based).
 
@@ -29,19 +30,18 @@ class CatalogEncoder(tf.keras.layers.Layer):
         proj_dim = max(64, emb_dim // 2)
 
         # Hashing + embedding for each string field
-        self.code_hash = tf.keras.layers.Hashing(num_bins=code_hash_bins)
-        self.code_emb = tf.keras.layers.Embedding(input_dim=code_hash_bins, output_dim=proj_dim)
+        self.code_hash = keras.layers.Hashing(num_bins=code_hash_bins)
+        self.code_emb = keras.layers.Embedding(input_dim=code_hash_bins, output_dim=proj_dim)
 
-        self.name_hash = tf.keras.layers.Hashing(num_bins=name_hash_bins)
-        self.name_emb = tf.keras.layers.Embedding(input_dim=name_hash_bins, output_dim=proj_dim)
+        self.name_hash = keras.layers.Hashing(num_bins=name_hash_bins)
+        self.name_emb = keras.layers.Embedding(input_dim=name_hash_bins, output_dim=proj_dim)
 
-        self.nature_hash = tf.keras.layers.Hashing(num_bins=nature_hash_bins)
-        self.nature_emb = tf.keras.layers.Embedding(input_dim=nature_hash_bins, output_dim=max(16, emb_dim // 8))
+        self.nature_hash = keras.layers.Hashing(num_bins=nature_hash_bins)
+        self.nature_emb = keras.layers.Embedding(input_dim=nature_hash_bins, output_dim=max(16, emb_dim // 8))
 
         # Projection to final emb_dim
-        concat_dim = proj_dim + proj_dim + max(16, emb_dim // 8)
-        self.proj = tf.keras.layers.Dense(self.emb_dim, activation=None)
-        self.norm = tf.keras.layers.LayerNormalization()
+        self.proj = keras.layers.Dense(self.emb_dim, activation=None)
+        self.norm = keras.layers.LayerNormalization()
 
     def call(self, inputs: dict[str, tf.Tensor]) -> tf.Tensor:
         number = tf.convert_to_tensor(inputs.get("number", ""), dtype=tf.string)

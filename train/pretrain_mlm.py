@@ -16,11 +16,16 @@ import os
 import tempfile
 from typing import Any
 
+# Ensure KERAS_BACKEND default before importing keras
+if not os.environ.get("KERAS_BACKEND"):
+	os.environ["KERAS_BACKEND"] = "tensorflow"
+
+import keras
 import tensorflow as tf
 from google.cloud import storage
 from transformers import AutoTokenizer, TFBertForMaskedLM
 
-from ..data.text_normalization import normalize_description
+from data.text_normalization import normalize_description
 
 
 def parse_example(serialized):
@@ -189,8 +194,8 @@ def main():
 
     # Model
     model = TFBertForMaskedLM.from_pretrained("bert-base-multilingual-cased")
-    optimizer = tf.keras.optimizers.Adam(learning_rate=3e-5)
-    loss = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction="sum_over_batch_size")
+    optimizer = keras.optimizers.Adam(learning_rate=3e-5)
+    loss = keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction="sum_over_batch_size")
     model.compile(optimizer=optimizer, loss=loss)
 
     # Keras expects (x, y, sample_weight); x and y are dict/tensor compatible shapes
