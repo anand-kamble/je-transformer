@@ -4,115 +4,149 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime
-import io
 import json
 import math
 import os
+import sys
 import time
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+import traceback
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional
 
-import numpy as np
 import pandas as pd
 import sqlalchemy as sa
 from google.cloud import secretmanager, storage
-from google.cloud.sql.connector import Connector, IPTypes
 from sqlalchemy import (Boolean, Column, DateTime, Integer, Numeric, String,
                         Table, Text)
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 
-# ----------------- DB engine via Cloud SQL Connector -----------------
+# ----------------- Simple debug helpers -----------------
 
-def create_engine_with_connector(
-    instance_connection_name: str,
-    db_name: str,
-    db_user: str,
-    enable_private_ip: bool = False,
-    enable_iam_auth: bool = True,
-    pool_size: int = 5,
-    max_overflow: int = 10,
+def _mask_secret(value: Optional[str]) -> str:
+    if not value:
+        return "None"
+    return "********"
+
+# ----------------- DB engine via local PostgresConnection -----------------
+
+# Ensure local import path for psql_connection when running as a script
+_CURRENT_DIR = Path(__file__).resolve().parent
+if str(_CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(_CURRENT_DIR))
+from psql_connection import PostgresConnection  # noqa: E402
+
+
+def create_engine_with_psql(
+    database_name: str,
+    db_user: Optional[str],
+    db_password: Optional[str],
 ) -> sa.Engine:
-    connector = Connector()
-
-    def getconn():
-        ip_type = IPTypes.PRIVATE if enable_private_ip else IPTypes.PUBLIC
-        return connector.connect(
-            instance_connection_name,
-            "pg8000",
-            user=db_user,
-            db=db_name,
-            enable_iam_auth=enable_iam_auth,
-            ip_type=ip_type,
-        )
-
-    engine = sa.create_engine(
-        "postgresql+pg8000://",
-        creator=getconn,
-        pool_size=pool_size,
-        max_overflow=max_overflow,
-        pool_pre_ping=True,
-        future=True,
-    )
+    # Allow overriding credentials via environment for PostgresConnection
+    if db_user:
+        os.environ["DB_USER"] = db_user
+    if db_password:
+        os.environ["DB_PASSWORD"] = db_password
+    pg = PostgresConnection(database_name=database_name)
+    engine = pg.get_engine()
+    print(f"[ingest] SQLAlchemy engine created via PostgresConnection (db={database_name})")
     return engine
 
 
 # ----------------- Schema (Core Tables) -----------------
 
-def reflect_or_define_tables(metadata: sa.MetaData) -> Dict[str, Table]:
-    journal_entry = Table(
-        "journal_entry",
-        metadata,
-        Column("journal_entry_id", PG_UUID, primary_key=True),
-        Column("business_id", Text, nullable=False),
-        Column("year_month", Integer, nullable=False),
-        Column("date", DateTime(timezone=True), nullable=False),
-        Column("number", Integer, nullable=False),
-        Column("description", Text, nullable=False),
-        Column("currency", String, nullable=False),
-        Column("journal_entry_type", Text, nullable=False),
-        Column("journal_entry_sub_type", Text, nullable=True),
-        Column("journal_entry_status", sa.types.UserDefinedType(), nullable=False),
-        Column("journal_entry_origin", sa.types.UserDefinedType(), nullable=False),
-    )
+def reflect_or_define_tables(
+    metadata: sa.MetaData,
+    engine: Optional[sa.Engine] = None,
+    schema: Optional[str] = None,
+) -> Dict[str, Table]:
+    """
+    Try to reflect tables from the database; if not present, fall back to defining known columns.
+    Table names can be overridden via env:
+      - JOURNAL_ENTRY_TABLE
+      - ENTRY_LINE_TABLE
+      - LEDGER_ACCOUNT_TABLE
+    """
+    je_name = os.environ.get("JOURNAL_ENTRY_TABLE", "journal_entry")
+    el_name = os.environ.get("ENTRY_LINE_TABLE", "entry_line")
+    la_name = os.environ.get("LEDGER_ACCOUNT_TABLE", "ledger_account")
+    print(f"[ingest] Using tables: journal_entry={je_name} entry_line={el_name} ledger_account={la_name} schema={schema}")
 
-    entry_line = Table(
-        "entry_line",
-        metadata,
-        Column("entry_line_id", PG_UUID, primary_key=True),
-        Column("journal_entry_id", PG_UUID, nullable=False),
-        Column("ledger_account_id", PG_UUID, nullable=True),
-        Column("index", Integer, nullable=False),
-        Column("description", Text, nullable=False),
-        Column("debit", Numeric, nullable=False),
-        Column("credit", Numeric, nullable=False),
-        Column("exchange_rate", Numeric, nullable=False),
-    )
+    def try_reflect(name: str) -> Optional[Table]:
+        if engine is None:
+            return None
+        try:
+            print(f"[ingest] Reflecting table: {name}")
+            tbl = Table(name, metadata, autoload_with=engine, schema=schema)
+            print(f"[ingest] Reflected table {name} columns={list(tbl.columns.keys())}")
+            return tbl
+        except Exception as e:
+            print(f"[ingest] Reflection failed for table {name} (schema={schema}): {e}")
+            return None
 
-    ledger_account = Table(
-        "ledger_account",
-        metadata,
-        Column("ledger_account_id", PG_UUID, primary_key=True),
-        Column("business_id", Text, nullable=False),
-        Column("number", Text, nullable=False),
-        Column("name", Text, nullable=False),
-        Column("parent_ledger_account_id", PG_UUID, nullable=True),
-        Column("currency", String, nullable=False),
-        Column("nature", String, nullable=False),
-        Column("ledger_account_type", Text, nullable=True),
-        Column("ledger_account_sub_type", Text, nullable=True),
-        Column("ledger_account_sub_sub_type", Text, nullable=True),
-        Column("ledger_account_status", sa.types.UserDefinedType(), nullable=False),
-        Column("foreign_exchange_adjustment_ledger_account_id", PG_UUID, nullable=True),
-        Column("cash_flow_group", sa.types.UserDefinedType(), nullable=True),
-        Column("added_date", DateTime(timezone=True), nullable=False),
-        Column("removed_date", DateTime(timezone=True), nullable=True),
-        Column("is_used_in_journal_entries", Boolean, nullable=False),
-    )
+    journal_entry = try_reflect(je_name)
+    entry_line = try_reflect(el_name)
+    ledger_account = try_reflect(la_name)
 
-    return {
-        "journal_entry": journal_entry,
-        "entry_line": entry_line,
-        "ledger_account": ledger_account,
-    }
+    if journal_entry is None:
+        print(f"[ingest] Defining fallback metadata for table: {je_name}")
+        journal_entry = Table(
+            je_name,
+            metadata,
+            Column("journal_entry_id", PG_UUID, primary_key=True),
+            Column("business_id", Text, nullable=False),
+            Column("year_month", Integer, nullable=False),
+            Column("date", DateTime(timezone=True), nullable=False),
+            Column("number", Integer, nullable=False),
+            Column("description", Text, nullable=False),
+            Column("currency", String, nullable=False),
+            Column("journal_entry_type", Text, nullable=False),
+            Column("journal_entry_sub_type", Text, nullable=True),
+            Column("journal_entry_status", sa.types.UserDefinedType(), nullable=False),
+            Column("journal_entry_origin", sa.types.UserDefinedType(), nullable=False),
+            schema=schema,
+        )
+
+    if entry_line is None:
+        print(f"[ingest] Defining fallback metadata for table: {el_name}")
+        entry_line = Table(
+            el_name,
+            metadata,
+            Column("entry_line_id", PG_UUID, primary_key=True),
+            Column("journal_entry_id", PG_UUID, nullable=False),
+            Column("ledger_account_id", PG_UUID, nullable=True),
+            Column("index", Integer, nullable=False),
+            Column("description", Text, nullable=False),
+            Column("debit", Numeric, nullable=False),
+            Column("credit", Numeric, nullable=False),
+            Column("exchange_rate", Numeric, nullable=False),
+            schema=schema,
+        )
+
+    if ledger_account is None:
+        print(f"[ingest] Defining fallback metadata for table: {la_name}")
+        ledger_account = Table(
+            la_name,
+            metadata,
+            Column("ledger_account_id", PG_UUID, primary_key=True),
+            Column("business_id", Text, nullable=False),
+            Column("number", Text, nullable=False),
+            Column("name", Text, nullable=False),
+            Column("parent_ledger_account_id", PG_UUID, nullable=True),
+            Column("currency", String, nullable=False),
+            Column("nature", String, nullable=False),
+            Column("ledger_account_type", Text, nullable=True),
+            Column("ledger_account_sub_type", Text, nullable=True),
+            Column("ledger_account_sub_sub_type", Text, nullable=True),
+            Column("ledger_account_status", sa.types.UserDefinedType(), nullable=False),
+            Column("foreign_exchange_adjustment_ledger_account_id", PG_UUID, nullable=True),
+            Column("cash_flow_group", sa.types.UserDefinedType(), nullable=True),
+            Column("added_date", DateTime(timezone=True), nullable=False),
+            Column("removed_date", DateTime(timezone=True), nullable=True),
+            Column("is_used_in_journal_entries", Boolean, nullable=False),
+            schema=schema,
+        )
+
+    return {"journal_entry": journal_entry, "entry_line": entry_line, "ledger_account": ledger_account}
 
 
 # ----------------- Secrets helpers -----------------
@@ -169,6 +203,7 @@ class AccountCatalog:
     @staticmethod
     def build(conn: sa.Connection, tables: Dict[str, Table], business_id: Optional[str]) -> "AccountCatalog":
         la = tables["ledger_account"]
+        print(f"[ingest] Building account catalog (business_id={business_id})")
         stmt = sa.select(
             la.c.ledger_account_id,
             la.c.business_id,
@@ -180,7 +215,13 @@ class AccountCatalog:
             stmt = stmt.where(la.c.business_id == business_id)
         stmt = stmt.order_by(la.c.number, la.c.name)
         rows = []
-        for row in conn.execute(stmt.execution_options(stream_results=True)):
+        try:
+            cur = conn.execute(stmt.execution_options(stream_results=True))
+        except Exception as e:
+            print(f"[ingest] Failed to execute catalog query: {e}")
+            traceback.print_exc()
+            raise
+        for row in cur:
             rec = {
                 "ledger_account_id": str(row.ledger_account_id),
                 "business_id": row.business_id,
@@ -189,10 +230,13 @@ class AccountCatalog:
                 "nature": row.nature,
             }
             rows.append(rec)
+        print(f"[ingest] Catalog rows loaded: {len(rows)}")
         id_to_index = {r["ledger_account_id"]: i for i, r in enumerate(rows)}
         return AccountCatalog(id_to_index=id_to_index, rows=rows)
 
     def to_artifact(self) -> Dict[str, Any]:
+        # Debug print for serialization
+        print(f"[ingest] Serializing account catalog (num_accounts={len(self.rows)})")
         return {
             "generated_at": int(time.time()),
             "num_accounts": len(self.rows),
@@ -224,6 +268,7 @@ def build_join_statement(
     el = tables["entry_line"]
     la = tables["ledger_account"]
 
+    print(f"[ingest] Building join (business_id={business_id}, start_date={start_date}, end_date={end_date})")
     stmt = (
         sa.select(
             je.c.journal_entry_id,
@@ -281,6 +326,7 @@ def write_parquet_shards(
     shard_records = 0
     records_written = 0
     shard_paths: List[str] = []
+    print(f"[ingest] Writing Parquet shards to {base_prefix} (shard_size={shard_size})")
 
     def make_shard_path(si: int) -> str:
         return f"{base_prefix}/parquet/part-{si:05d}-{timestamp}.parquet"
@@ -293,7 +339,12 @@ def write_parquet_shards(
         start_date=filters.get("start_date"),
         end_date=filters.get("end_date"),
     )
-    result = conn.execute(stmt.execution_options(stream_results=True))
+    try:
+        result = conn.execute(stmt.execution_options(stream_results=True))
+    except Exception as e:
+        print(f"[ingest] Failed to execute main join statement: {e}")
+        traceback.print_exc()
+        raise
 
     current_je_id: Optional[str] = None
     current_je: Dict[str, Any] = {}
@@ -306,6 +357,7 @@ def write_parquet_shards(
         nonlocal shard_index, shard_records, records_written, current_rows
         if current_je_id is None:
             return
+        print(f"[ingest] Flushing JE {current_je.get('journal_entry_id')} (rows_in_shard={len(current_rows)}, shard_index={shard_index})")
         row = {
             "journal_entry_id": current_je.get("journal_entry_id"),
             "business_id": current_je.get("business_id"),
@@ -328,6 +380,7 @@ def write_parquet_shards(
             # write shard
             out_path = make_shard_path(shard_index)
             _write_rows_parquet(current_rows, out_path)
+            print(f"[ingest] Shard written: {out_path} (records_in_shard={shard_records}, total_records={records_written})")
             shard_paths.append(out_path)
             shard_index += 1
             shard_records = 0
@@ -382,6 +435,7 @@ def write_parquet_shards(
     if current_rows:
         out_path = make_shard_path(shard_index)
         _write_rows_parquet(current_rows, out_path)
+        print(f"[ingest] Final shard written: {out_path} (records_in_shard={len(current_rows)}, total_records={records_written})")
         shard_paths.append(out_path)
 
     return {
@@ -403,6 +457,7 @@ def _write_rows_parquet(rows: List[Dict[str, Any]], gcs_uri: str) -> None:
     for col in ("debit_accounts", "credit_accounts", "debit_amounts_norm", "credit_amounts_norm"):
         if col in df.columns:
             df[col] = df[col].apply(lambda x: list(x) if isinstance(x, Iterable) and not isinstance(x, (str, bytes)) else [])
+    print(f"[ingest] Writing {len(df)} rows to {gcs_uri}")
     df.to_parquet(gcs_uri, engine="pyarrow", index=False)
 
 
@@ -421,21 +476,22 @@ def main() -> None:
     parser.add_argument("--db", type=str, default=os.environ.get("DB_NAME", "postgres"))
     parser.add_argument("--db-user", type=str, default=os.environ.get("DB_USER"))
     parser.add_argument("--db-user-secret", type=str, default=os.environ.get("DB_USER_SECRET_NAME"))
+    parser.add_argument("--db-password", type=str, default=os.environ.get("DB_PASSWORD"))
+    parser.add_argument("--db-password-secret", type=str, default=os.environ.get("DB_PASSWORD_SECRET_NAME"))
     parser.add_argument("--private-ip", action="store_true")
     parser.add_argument("--gcs-output-uri", type=str, default=os.environ.get("GCS_OUTPUT_URI"), required=False)
     parser.add_argument("--gcs-output-uri-secret", type=str, default=os.environ.get("GCS_OUTPUT_URI_SECRET_NAME"))
-    parser.add_argument("--business-id", type=str, default=os.environ.get("BUSINESS_ID"))
+    parser.add_argument("--business-id", type=str, default="bu-651")
     parser.add_argument("--start-date", type=str, default=os.environ.get("START_DATE"))
     parser.add_argument("--end-date", type=str, default=os.environ.get("END_DATE"))
     parser.add_argument("--shard-size", type=int, default=int(os.environ.get("SHARD_SIZE", "10000")))
     parser.add_argument("--secrets-project", type=str, default=os.environ.get("SECRETS_PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT"))
+    parser.add_argument("--db-schema", type=str, default="public")
     args = parser.parse_args()
-
-    if not args.instance:
-        parser.error("--instance (or env DB_INSTANCE_CONNECTION_NAME) is required")
 
     # Resolve secrets
     db_user = access_secret(args.secrets_project, args.db_user_secret) or args.db_user
+    db_password = access_secret(args.secrets_project, args.db_password_secret) or args.db_password
     gcs_output = access_secret(args.secrets_project, args.gcs_output_uri_secret) or args.gcs_output_uri
     if not db_user:
         parser.error("--db-user (or secret) is required")
@@ -444,19 +500,37 @@ def main() -> None:
 
     start_date = parse_date(args.start_date)
     end_date = parse_date(args.end_date)
+    print(f"[ingest] Inputs: db={args.db} schema={args.db_schema} user={db_user} gcs_output={gcs_output} start={start_date} end={end_date}")
 
-    engine = create_engine_with_connector(
-        instance_connection_name=args.instance,
-        db_name=args.db,
+    engine = create_engine_with_psql(
+        database_name=args.db,
         db_user=db_user,
-        enable_private_ip=bool(args.private_ip),
-        enable_iam_auth=True,
+        db_password=db_password,
     )
     metadata = sa.MetaData()
-    tables = reflect_or_define_tables(metadata)
+    tables = reflect_or_define_tables(metadata, engine=engine, schema=args.db_schema or "public")
+
+    # Preflight: verify required tables exist in the specified schema
+    inspector = sa.inspect(engine)
+    required_names = {
+        "journal_entry": os.environ.get("JOURNAL_ENTRY_TABLE", "journal_entry"),
+        "entry_line": os.environ.get("ENTRY_LINE_TABLE", "entry_line"),
+        "ledger_account": os.environ.get("LEDGER_ACCOUNT_TABLE", "ledger_account"),
+    }
+    missing = []
+    for _key, tbl_name in required_names.items():
+        if not inspector.has_table(tbl_name, schema=args.db_schema or "public"):
+            missing.append(f"{args.db_schema}.{tbl_name}")
+    if missing:
+        raise RuntimeError(
+            "[ingest] Required tables not found in database. "
+            f"Missing: {', '.join(missing)}. "
+            "Set --db-schema/DB_SCHEMA and JOURNAL_ENTRY_TABLE/ENTRY_LINE_TABLE/LEDGER_ACCOUNT_TABLE as needed."
+        )
 
     with engine.connect() as conn:
         # Build account catalog snapshot
+        print("[ingest] Building accounts artifact and writing Parquet shards")
         catalog = AccountCatalog.build(conn, tables, business_id=args.business_id)
         client = storage.Client()
         timestamp = time.strftime("%Y%m%d-%H%M%S")

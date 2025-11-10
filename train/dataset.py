@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import glob
-import os
+import json
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -73,13 +73,60 @@ class ParquetJEDataset(Dataset):
         input_ids = torch.tensor(enc["input_ids"], dtype=torch.long)
         attention_mask = torch.tensor(enc["attention_mask"], dtype=torch.long)
 
-        deb = [int(x) for x in (row.get("debit_accounts") or [])]
-        cre = [int(x) for x in (row.get("credit_accounts") or [])]
+        # Helpers to safely convert Parquet-loaded list-like fields
+        def _safe_to_list(value: Any) -> List[Any]:
+            if value is None:
+                return []
+            if isinstance(value, (list, tuple)):
+                return list(value)
+            if isinstance(value, np.ndarray):
+                return value.tolist()
+            # Only call pd.isna for obvious scalars, not arrays
+            if isinstance(value, (bytes, bytearray)):
+                try:
+                    s_text_bytes: str = value.decode("utf-8").strip()
+                except Exception:
+                    return []
+                if len(s_text_bytes) >= 2 and ((s_text_bytes[0] == "[" and s_text_bytes[-1] == "]") or (s_text_bytes[0] == "(" and s_text_bytes[-1] == ")")):
+                    try:
+                        s_json = "[" + s_text_bytes[1:-1] + "]" if (s_text_bytes[0] == "(" and s_text_bytes[-1] == ")") else s_text_bytes
+                        parsed = json.loads(s_json)
+                        return list(parsed) if isinstance(parsed, (list, tuple)) else []
+                    except Exception:
+                        return []
+                return []
+            if isinstance(value, str):
+                s_text: str = value.strip()
+                if len(s_text) >= 2 and ((s_text[0] == "[" and s_text[-1] == "]") or (s_text[0] == "(" and s_text[-1] == ")")):
+                    try:
+                        s_json = "[" + s_text[1:-1] + "]" if (s_text[0] == "(" and s_text[-1] == ")") else s_text
+                        parsed = json.loads(s_json)
+                        return list(parsed) if isinstance(parsed, (list, tuple)) else []
+                    except Exception:
+                        return []
+                return []
+            # Fallback: treat scalars/others as empty
+            try:
+                if pd.isna(value):
+                    return []
+            except Exception:
+                pass
+            return []
+
+        def _to_int_list(value: Any) -> List[int]:
+            return [int(x) for x in _safe_to_list(value)]
+
+        def _to_float_list(value: Any) -> List[float]:
+            return [float(x) for x in _safe_to_list(value)]
+
+        deb = _to_int_list(row.get("debit_accounts"))
+        cre = _to_int_list(row.get("credit_accounts"))
+        
         prev_acc, prev_side, tgt_acc, tgt_side, tgt_stop = build_targets_from_sets(deb, cre, self.max_lines)
 
         # Flow supervision (optional)
-        debit_weights = row.get("debit_amounts_norm") or []
-        credit_weights = row.get("credit_amounts_norm") or []
+        debit_weights = _to_float_list(row.get("debit_amounts_norm"))
+        credit_weights = _to_float_list(row.get("credit_amounts_norm"))
 
         features = {
             "input_ids": input_ids,

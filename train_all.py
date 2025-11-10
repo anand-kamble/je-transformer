@@ -82,6 +82,7 @@ def main() -> None:
         instance_connection_name=args.instance,
         db_name=args.db,
         db_user=args.db_user,
+        db_password=os.environ.get("DB_PASSWORD"),
         enable_private_ip=bool(args.private_ip),
         enable_iam_auth=True,
     )

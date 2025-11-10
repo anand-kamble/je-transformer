@@ -8,11 +8,12 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
+from dotenv import load_dotenv
 from torch.utils.data import DataLoader, Subset
 
 from data.ingest_to_parquet import (AccountCatalog, build_join_statement,
-                                    create_engine_with_connector,
-                                    date_features, normalize_amounts,
+                                    create_engine_with_psql, date_features,
+                                    normalize_amounts,
                                     reflect_or_define_tables, write_gcs_json,
                                     write_parquet_shards)
 from models.catalog_encoder import CatalogEncoder
@@ -21,6 +22,7 @@ from models.losses import (SetF1Metric, coverage_penalty, flow_aux_loss,
                            pointer_loss, side_loss, stop_loss)
 from train.dataset import ParquetJEDataset, collate_fn
 
+load_dotenv(override=True)
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -33,6 +35,7 @@ def set_seed(seed: int) -> None:
 
 
 def load_json_from_uri(uri: str) -> Dict[str, Any]:
+    print(f"Loading JSON from URI: {uri}")
     if uri.startswith("gs://"):
         from google.cloud import storage
 
@@ -67,7 +70,7 @@ def main() -> None:
     parser.add_argument(
         "--accounts-artifact",
         type=str,
-        default=os.environ.get("ACCOUNTS_ARTIFACT", "./data/artifacts/accounts.json"),
+        default=os.environ.get("ACCOUNTS_ARTIFACT"),
         help="Accounts JSON (local or gs://) (default: ./data/artifacts/accounts.json or $ACCOUNTS_ARTIFACT)",
     )
     parser.add_argument(
@@ -79,8 +82,9 @@ def main() -> None:
     # Optional: end-to-end ingestion (Cloud SQL -> Parquet on GCS) before training
     parser.add_argument("--project", type=str, default=os.environ.get("GOOGLE_CLOUD_PROJECT"))
     parser.add_argument("--instance", type=str, default=os.environ.get("DB_INSTANCE_CONNECTION_NAME", "lb01-438216:us-central1:db-3-postgres"))
-    parser.add_argument("--db", type=str, default=os.environ.get("DB_NAME", "postgres"))
+    parser.add_argument("--db", type=str, default=os.environ.get("DB_NAME", "liebre_dev"))
     parser.add_argument("--db-user", type=str, default=os.environ.get("DB_USER","postgres"))
+    parser.add_argument("--db-password", type=str, default=os.environ.get("DB_PASSWORD","PC=?gB>i6LB5]T9n"))
     parser.add_argument("--private-ip", action="store_true")
     parser.add_argument(
         "--gcs-output-uri",
@@ -88,7 +92,7 @@ def main() -> None:
         default=os.environ.get("GCS_OUTPUT_URI", "./out_small_ingest"),
         help="Where to write Parquet/artifacts. If starts with gs://, writes to GCS else to local dir (default: ./out_small_ingest)",
     )
-    parser.add_argument("--business-id", type=str, default=os.environ.get("BUSINESS_ID"))
+    parser.add_argument("--business-id", type=str, default=os.environ.get("BUSINESS_ID", "bu-651"))
     parser.add_argument("--start-date", type=str, default=os.environ.get("START_DATE"))
     parser.add_argument("--end-date", type=str, default=os.environ.get("END_DATE"))
     parser.add_argument("--shard-size", type=int, default=int(os.environ.get("SHARD_SIZE", "2000")))
@@ -98,7 +102,7 @@ def main() -> None:
     parser.add_argument("--max-lines", type=int, default=4)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--flow-weight", type=float, default=0.05)
     parser.add_argument("--limit", type=int, default=200, help="Train on first N examples only")
@@ -116,12 +120,10 @@ def main() -> None:
     if args.gcs_output_uri:
         if not args.instance or not args.db_user:
             raise ValueError("--instance and --db-user are required (or set DB_INSTANCE_CONNECTION_NAME/DB_USER) to run ingestion")
-        engine = create_engine_with_connector(
-            instance_connection_name=args.instance,
-            db_name=args.db,
+        engine = create_engine_with_psql(
+            database_name=args.db,
             db_user=args.db_user,
-            enable_private_ip=bool(args.private_ip),
-            enable_iam_auth=True,
+            db_password=args.db_password,
         )
         import json as _json
         import time
@@ -129,7 +131,7 @@ def main() -> None:
         import pandas as _pd
         import sqlalchemy as sa
         metadata = sa.MetaData()
-        tables = reflect_or_define_tables(metadata)
+        tables = reflect_or_define_tables(metadata, engine=engine, schema=os.environ.get("DB_SCHEMA", "public"))
         with engine.connect() as conn:
             catalog = AccountCatalog.build(conn, tables, business_id=args.business_id)
             ts = time.strftime("%Y%m%d-%H%M%S")
@@ -164,6 +166,7 @@ def main() -> None:
                 shard_index = 0
                 shard_records = 0
                 current_rows: List[Dict[str, Any]] = []
+                all_entries: List[Dict[str, Any]] = []
                 stmt = build_join_statement(
                     tables=tables,
                     business_id=args.business_id,
@@ -204,6 +207,7 @@ def main() -> None:
                     row["debit_amounts_norm"] = normalize_amounts(debit_amounts)
                     row["credit_amounts_norm"] = normalize_amounts(credit_amounts)
                     current_rows.append(row)
+                    all_entries.append(row)
                     shard_records += 1
                     if shard_records >= shard_size:
                         _ = write_shard(current_rows, shard_index)
@@ -257,6 +261,10 @@ def main() -> None:
                 if current_rows:
                     _ = write_shard(current_rows, shard_index)
                 parquet_pattern = os.path.join(base_dir, "parquet", "*.parquet")
+                # Write the full set of journal entries as a JSON artifact for training/inspection
+                entries_json_path = os.path.join(base_dir, "artifacts", f"journal_entries_{ts}.json")
+                with open(entries_json_path, "w", encoding="utf-8") as jf:
+                    _json.dump(all_entries, jf, ensure_ascii=False, indent=2)
 
     # Dataset and small subset
     full_ds = ParquetJEDataset(parquet_pattern, tokenizer_loc=args.encoder, max_length=args.max_length, max_lines=args.max_lines)
@@ -319,7 +327,6 @@ def main() -> None:
                 credit_weights,
             ) * float(args.flow_weight)
             total = pl + sl + stl + cov + flow
-            total.backward()
             optimizer.step()
 
             if step % 20 == 0:
@@ -355,5 +362,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
