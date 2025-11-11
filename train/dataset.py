@@ -168,6 +168,8 @@ class ParquetJEDataset(Dataset):
         features = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
+			"journal_entry_id": str(row.get("journal_entry_id", "")),
+			"description": desc,
             "prev_account_idx": torch.tensor(prev_acc, dtype=torch.long),
             "prev_side_id": torch.tensor(prev_side, dtype=torch.long),
             "cond_numeric": torch.tensor(
@@ -211,6 +213,9 @@ def collate_fn(batch: List[Tuple[Dict[str, Any], Dict[str, Any]]]):
     stack_tensor_field("prev_account_idx", torch.long)
     stack_tensor_field("prev_side_id", torch.long)
     out_feats["cond_numeric"] = torch.stack([f["cond_numeric"] for f in feats]).to(dtype=torch.float32)
+    # Non-tensor metadata fields (kept as Python lists for downstream eval/visualization)
+    out_feats["journal_entry_id"] = [f["journal_entry_id"] for f in feats]
+    out_feats["description"] = [f["description"] for f in feats]
     out_feats["currency"] = [f["currency"] for f in feats]
     out_feats["journal_entry_type"] = [f["journal_entry_type"] for f in feats]
 

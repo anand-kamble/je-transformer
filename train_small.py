@@ -23,6 +23,7 @@ from models.je_model_torch import JEModel, mean_pool
 from models.losses import (SetF1Metric, coverage_penalty, flow_aux_loss,
                            pointer_loss, side_loss, stop_loss)
 from train.dataset import ParquetJEDataset, collate_fn
+from eval.retrieval_metrics import aggregate_retrieval_metrics
 
 
 load_dotenv(override=True)
@@ -126,6 +127,11 @@ def main() -> None:
     parser.add_argument("--retrieval-index-dir", type=str, default=os.environ.get("RETRIEVAL_INDEX_DIR"), help="ScaNN index dir (gs://). Enables retrieval when provided")
     parser.add_argument("--retrieval-top-k", type=int, default=int(os.environ.get("RETRIEVAL_TOP_K", "5")))
     parser.add_argument("--retrieval-use-cls", action="store_true", help="Use [CLS] for pooling the query (defaults to mean pooling)")
+    # Validation/eval
+    parser.add_argument("--val-ratio", type=float, default=0.1, help="Fraction of training subset reserved for validation")
+    parser.add_argument("--max-val-batches", type=int, default=0, help="Max validation batches per epoch (0=all)")
+    parser.add_argument("--log-retrieval-heatmaps", action="store_true", help="Log retrieval fusion weight heatmaps to W&B")
+    parser.add_argument("--eval-samples", type=int, default=4, help="Num samples to visualize for retrieval heatmaps")
     parser.add_argument("--limit", type=int, default=20000, help="Train on first N examples only")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--wandb-project", type=str, default="je-transformer", help="W&B project name")
@@ -219,6 +225,8 @@ def main() -> None:
             wandb.define_metric("train/*", step_metric="step")
             wandb.define_metric("epoch")
             wandb.define_metric("train/*", step_metric="epoch")
+            wandb.define_metric("val/*", step_metric="epoch")
+            wandb.define_metric("retrieval/*", step_metric="epoch")
         except Exception as e:
             print(f"Warning: Failed to initialize wandb: {e}")
             wandb_enabled = False
@@ -233,17 +241,72 @@ def main() -> None:
     accounts_artifact_path = args.accounts_artifact
 
 
-    # Dataset and small subset
+    # Dataset and small subset + validation split
     full_ds = ParquetJEDataset(parquet_pattern, tokenizer_loc=args.encoder, max_length=args.max_length, max_lines=args.max_lines)
     n = len(full_ds)
     lim = max(1, min(int(args.limit), n))
     subset_indices: List[int] = list(range(lim))
-    ds = Subset(full_ds, subset_indices)
-    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=collate_fn)
+    # Deterministic shuffle for split
+    rng = np.random.RandomState(int(args.seed) if args.seed is not None else 0)
+    rng.shuffle(subset_indices)
+    val_count = int(max(1, round(float(args.val_ratio) * len(subset_indices)))) if args.val_ratio > 0 else 0
+    val_indices = subset_indices[:val_count] if val_count > 0 else []
+    train_indices = subset_indices[val_count:] if val_count > 0 else subset_indices
+    train_ds = Subset(full_ds, train_indices)
+    val_ds = Subset(full_ds, val_indices) if val_indices else None
+    dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=collate_fn)
+    dl_val = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate_fn) if val_ds is not None else None
 
 
     artifact = load_json_from_uri(accounts_artifact_path)
     cat_emb = build_catalog_embeddings(artifact, emb_dim=args.hidden_dim, device=device)
+
+    # Build journal_entry_id -> account set mapping for retrieval metrics (from full dataframe)
+    jeid_to_accountset: Dict[str, set] = {}
+    try:
+        df_local = full_ds.df
+        def _safe_to_list(value: Any) -> List[Any]:
+            if value is None:
+                return []
+            if isinstance(value, (list, tuple)):
+                return list(value)
+            if isinstance(value, np.ndarray):
+                return value.tolist()
+            if isinstance(value, (bytes, bytearray)):
+                try:
+                    s_text_bytes: str = value.decode("utf-8").strip()
+                except Exception:
+                    return []
+                if len(s_text_bytes) >= 2 and ((s_text_bytes[0] == "[" and s_text_bytes[-1] == "]") or (s_text_bytes[0] == "(" and s_text_bytes[-1] == ")")):
+                    import json as _json
+                    try:
+                        s_json = "[" + s_text_bytes[1:-1] + "]" if (s_text_bytes[0] == "(" and s_text_bytes[-1] == ")") else s_text_bytes
+                        parsed = _json.loads(s_json)
+                        return list(parsed) if isinstance(parsed, (list, tuple)) else []
+                    except Exception:
+                        return []
+                return []
+            if isinstance(value, str):
+                s_text = value.strip()
+                if len(s_text) >= 2 and ((s_text[0] == "[" and s_text[-1] == "]") or (s_text[0] == "(" and s_text[-1] == ")")):
+                    import json as _json
+                    try:
+                        s_json = "[" + s_text[1:-1] + "]" if (s_text[0] == "(" and s_text[-1] == ")") else s_text
+                        parsed = _json.loads(s_json)
+                        return list(parsed) if isinstance(parsed, (list, tuple)) else []
+                    except Exception:
+                        return []
+                return []
+            return []
+        for _, r in df_local.iterrows():
+            jid = str(r.get("journal_entry_id", "") or "")
+            if not jid:
+                continue
+            deb_l = [int(x) for x in _safe_to_list(r.get("debit_accounts"))]
+            cre_l = [int(x) for x in _safe_to_list(r.get("credit_accounts"))]
+            jeid_to_accountset[jid] = set(deb_l + cre_l)
+    except Exception as _emap_e:
+        print(f"[retrieval-metrics] Warning: failed building jeid->account_set mapping: {_emap_e}")
 
 
     model = JEModel(
@@ -261,6 +324,7 @@ def main() -> None:
     _retr_searcher = None
     _retr_proj_embs = None  # torch.Tensor on CPU [N, H_hidden]
     _normalize_queries = True
+    _retr_index_ids: Optional[List[str]] = None  # aligned to index/embeddings
     if not retrieval_enabled:
         print("[retrieval] Disabled: --retrieval-index-dir not provided")
     if retrieval_enabled:
@@ -394,6 +458,7 @@ def main() -> None:
             candidates: List[str] = []
             if manifest and isinstance(manifest.get("files", {}), dict):
                 emb_rel = manifest["files"].get("embeddings")
+                ids_rel = manifest["files"].get("ids")
                 if emb_rel:
                     candidates.append(os.path.join(_idx_dir_local, emb_rel))
             candidates.extend([
@@ -410,6 +475,20 @@ def main() -> None:
                     break
             if emb_np is None:
                 raise RuntimeError("Could not locate retrieval embeddings (tried manifest → embeddings.npy → dataset.npy).")
+            # Load ids aligned to embeddings/index if available
+            _ids_path = os.path.join(_idx_dir_local, "ids.txt")
+            if os.path.exists(_ids_path):
+                with open(_ids_path, "r", encoding="utf-8") as f:
+                    _retr_index_ids = [line.strip() for line in f if line.strip()]
+                print(f"[retrieval] Loaded ids.txt with {len(_retr_index_ids)} ids")
+            elif manifest and isinstance(manifest.get("files", {}), dict) and ids_rel:
+                _alt = os.path.join(_idx_dir_local, ids_rel)
+                if os.path.exists(_alt):
+                    with open(_alt, "r", encoding="utf-8") as f:
+                        _retr_index_ids = [line.strip() for line in f if line.strip()]
+                    print(f"[retrieval] Loaded ids via manifest path with {len(_retr_index_ids)} ids")
+            else:
+                print("[retrieval] Warning: ids.txt not found; retrieval metrics will be limited")
             # Project to hidden_dim using the model's enc_proj and tanh, on CPU and no grad
             with torch.no_grad():
                 emb_t = torch.tensor(emb_np, dtype=torch.float32)  # CPU
@@ -438,6 +517,26 @@ def main() -> None:
                 mem_list.append(mem_i)
             mem = torch.stack(mem_list, dim=0).to(device)  # [B, K, H]
         return mem
+    # Helper for validation: return both neighbor indices and retrieval memory
+    def _neighbors_and_memory_batch(_inp_ids: torch.Tensor, _attn: torch.Tensor) -> Optional[tuple]:
+        if not retrieval_enabled:
+            return None
+        assert _retr_searcher is not None and _retr_proj_embs is not None
+        with torch.no_grad():
+            enc_out = model.encoder(input_ids=_inp_ids, attention_mask=_attn)
+            pooled = enc_out.last_hidden_state[:, 0, :] if args.retrieval_use_cls else mean_pool(enc_out.last_hidden_state, _attn)
+            q_cpu = pooled.detach().cpu()
+            if _normalize_queries:
+                q_cpu = q_cpu / (q_cpu.norm(dim=1, keepdim=True) + 1e-8)
+            nbrs, _ = _retr_searcher.search_batched(q_cpu.numpy(), final_num_neighbors=int(args.retrieval_top_k))
+            mem_list = []
+            for i in range(len(nbrs)):
+                idx_tensor = torch.tensor(nbrs[i], dtype=torch.long)
+                mem_i = _retr_proj_embs.index_select(0, idx_tensor)  # [K, H]
+                mem_list.append(mem_i)
+            mem = torch.stack(mem_list, dim=0).to(device)  # [B, K, H]
+            return nbrs, mem
+        return None
     if args.trainable_catalog:
         try:
             model.set_catalog_embeddings(cat_emb)
@@ -584,6 +683,161 @@ def main() -> None:
                     except Exception as e:
                         print(f"Warning: Failed to log to wandb: {e}")
         
+        # End-of-epoch validation
+        if dl_val is not None:
+            model.eval()
+            val_steps_done = 0
+            val_total = 0.0
+            val_pl = 0.0
+            val_sl = 0.0
+            val_stl = 0.0
+            val_cov = 0.0
+            val_flow = 0.0
+            val_metric = SetF1Metric()
+            # Retrieval metrics aggregation buffers
+            retr_query_ids: List[str] = []
+            retr_topk_indices: List[List[int]] = []
+            first_heatmaps_logged = False
+            with torch.no_grad():
+                for v_features, v_targets in dl_val:
+                    input_ids_v = v_features["input_ids"].to(device)
+                    attn_v = v_features["attention_mask"].to(device)
+                    prev_acc_v = v_features["prev_account_idx"].to(device)
+                    prev_side_v = v_features["prev_side_id"].to(device)
+                    cond_num_v = v_features["cond_numeric"].to(device)
+                    curr_v = v_features["currency"]
+                    jtyp_v = v_features["journal_entry_type"]
+                    tgt_acc_v = v_targets["target_account_idx"].to(device)
+                    tgt_side_v = v_targets["target_side_id"].to(device)
+                    tgt_stop_v = v_targets["target_stop_id"].to(device)
+                    deb_idx_v = v_targets["debit_indices"].to(device)
+                    deb_w_v = v_targets["debit_weights"].to(device)
+                    cre_idx_v = v_targets["credit_indices"].to(device)
+                    cre_w_v = v_targets["credit_weights"].to(device)
+                    # Build retrieval memory and also get neighbor indices if enabled
+                    retr_mem_v = None
+                    nbrs_v = None
+                    if retrieval_enabled:
+                        nbrs_mem = _neighbors_and_memory_batch(input_ids_v, attn_v)
+                        if nbrs_mem is not None:
+                            nbrs_v, retr_mem_v = nbrs_mem
+                    outs_v = model(
+                        input_ids=input_ids_v,
+                        attention_mask=attn_v,
+                        prev_account_idx=prev_acc_v,
+                        prev_side_id=prev_side_v,
+                        catalog_embeddings=cat_emb,
+                        retrieval_memory=retr_mem_v,
+                        cond_numeric=cond_num_v,
+                        currency=curr_v,
+                        journal_entry_type=jtyp_v,
+                        return_retrieval_weights=bool(args.log_retrieval_heatmaps and retrieval_enabled and not first_heatmaps_logged),
+                    )
+                    pp_v = torch.softmax(outs_v["pointer_logits"], dim=-1)
+                    sp_v = torch.softmax(outs_v["side_logits"], dim=-1)
+                    pl_v = pointer_loss(outs_v["pointer_logits"], tgt_acc_v, ignore_index=-1)
+                    sl_v = side_loss(outs_v["side_logits"], tgt_side_v, ignore_index=-1)
+                    stl_v = stop_loss(outs_v["stop_logits"], tgt_stop_v, ignore_index=-1)
+                    cov_v = coverage_penalty(outs_v["pointer_logits"], probs=pp_v) * 0.01
+                    flow_w_now = float(args.flow_weight) * (float(args.flow_warmup_multiplier) if epoch < int(args.flow_warmup_epochs) else 1.0)
+                    flow_v = flow_aux_loss(
+                        outs_v["pointer_logits"],
+                        outs_v["side_logits"],
+                        deb_idx_v,
+                        deb_w_v,
+                        cre_idx_v,
+                        cre_w_v,
+                        pointer_probs=pp_v,
+                        side_probs=sp_v,
+                    ) * flow_w_now
+                    total_v = pl_v + sl_v + stl_v + cov_v + flow_v
+                    val_total += float(total_v.item())
+                    val_pl += float(pl_v.item())
+                    val_sl += float(sl_v.item())
+                    val_stl += float(stl_v.item())
+                    val_cov += float(cov_v.item())
+                    val_flow += float(flow_v.item())
+                    val_metric.update_state(
+                        outs_v["pointer_logits"].detach().cpu(),
+                        outs_v["side_logits"].detach().cpu(),
+                        tgt_acc_v.detach().cpu(),
+                        tgt_side_v.detach().cpu(),
+                        tgt_stop_v.detach().cpu(),
+                    )
+                    # Accumulate retrieval neighbors and query ids for metrics
+                    if retrieval_enabled and nbrs_v is not None:
+                        retr_topk_indices.extend([list(x) for x in nbrs_v])
+                        qids_batch = [str(x) for x in v_features.get("journal_entry_id", [""] * len(nbrs_v))]
+                        retr_query_ids.extend(qids_batch)
+                    # Log heatmaps once
+                    if (
+                        retrieval_enabled
+                        and args.log_retrieval_heatmaps
+                        and not first_heatmaps_logged
+                        and "retrieval_weights" in outs_v
+                    ):
+                        try:
+                            rw = outs_v["retrieval_weights"].detach().cpu().numpy()  # [B, T, K]
+                            import numpy as _npimg
+                            images = []
+                            max_items = min(int(args.eval_samples), rw.shape[0])
+                            # If we have neighbor ranks, use them for captions
+                            nbrs_for_caption = nbrs_v if nbrs_v is not None else [[] for _ in range(rw.shape[0])]
+                            for i in range(max_items):
+                                mat = rw[i]  # [T, K]
+                                # Normalize to 0..255 for visualization
+                                mn = float(mat.min()) if mat.size else 0.0
+                                mx = float(mat.max()) if mat.size else 1.0
+                                den = (mx - mn) if (mx - mn) > 1e-8 else 1.0
+                                img = ((mat - mn) / den * 255.0).astype(_npimg.uint8)
+                                # Build caption from neighbor ids if available
+                                cap = ""
+                                if _retr_index_ids is not None and len(nbrs_for_caption) > i:
+                                    nids = [(_retr_index_ids[j] if 0 <= j < len(_retr_index_ids) else "") for j in nbrs_for_caption[i]]
+                                    cap = f"neighbors: {', '.join(nids[:5])}"
+                                images.append(wandb.Image(img, caption=cap))
+                            if images and wandb_enabled:
+                                wandb.log({f"retrieval/heatmaps": images, "epoch": epoch})
+                            first_heatmaps_logged = True
+                        except Exception as _img_e:
+                            print(f"[wandb] Warning: failed logging retrieval heatmaps: {_img_e}")
+                    val_steps_done += 1
+                    if int(args.max_val_batches) > 0 and val_steps_done >= int(args.max_val_batches):
+                        break
+            # Finalize val metrics
+            den = float(max(val_steps_done, 1))
+            val_logs = {
+                "epoch": epoch,
+                "val/loss": val_total / den,
+                "val/pointer_loss": val_pl / den,
+                "val/side_loss": val_sl / den,
+                "val/stop_loss": val_stl / den,
+                "val/coverage_penalty": val_cov / den,
+                "val/flow_loss": val_flow / den,
+                "val/set_f1": float(val_metric.result().item()) if hasattr(val_metric, "result") else 0.0,
+            }
+            if wandb_enabled:
+                try:
+                    wandb.log(val_logs)
+                except Exception as _vlog_e:
+                    print(f"[wandb] Warning: failed logging val metrics: {_vlog_e}")
+            # Retrieval quality metrics
+            if retrieval_enabled and _retr_index_ids is not None and retr_query_ids and retr_topk_indices:
+                try:
+                    retr_metrics = aggregate_retrieval_metrics(
+                        query_ids=retr_query_ids,
+                        topk_indices=retr_topk_indices,
+                        index_ids=_retr_index_ids,
+                        jeid_to_accountset=jeid_to_accountset,
+                    )
+                    retr_logs = {f"retrieval/{k}": float(v) for k, v in retr_metrics.items()}
+                    retr_logs["epoch"] = epoch
+                    if wandb_enabled:
+                        wandb.log(retr_logs)
+                except Exception as _rme:
+                    print(f"[retrieval-metrics] Warning: failed to compute/log retrieval metrics: {_rme}")
+            model.train()
+
         # Use last metrics from epoch, or default if none available
         if last_metrics is None:
             # Fallback if no metrics were recorded

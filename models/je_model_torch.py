@@ -103,6 +103,7 @@ class JEModel(nn.Module):
         cond_numeric: torch.Tensor,
         currency: Union[List[str], torch.Tensor],
         journal_entry_type: Union[List[str], torch.Tensor],
+		return_retrieval_weights: bool = False,
     ) -> Dict[str, torch.Tensor]:
         B = input_ids.shape[0]
         T = self.max_lines
@@ -164,8 +165,11 @@ class JEModel(nn.Module):
 
         side_logits = self.side_head(dec_h_fused)
         stop_logits = self.stop_head(dec_h_fused)
-        return {
-            "pointer_logits": pointer_logits,
-            "side_logits": side_logits,
-            "stop_logits": stop_logits,
-        }
+        out: Dict[str, torch.Tensor] = {
+			"pointer_logits": pointer_logits,
+			"side_logits": side_logits,
+			"stop_logits": stop_logits,
+		}
+        if return_retrieval_weights:
+            out["retrieval_weights"] = weights
+        return out
