@@ -58,8 +58,8 @@ def upload_dir_to_gcs(local_dir: str, gcs_dir: str) -> None:
     for root, _, files in os.walk(local_dir):
         for f in files:
             lp = os.path.join(root, f)
-            rel = os.path.relpath(lp, start=local_dir)
-            blob = bucket.blob(f"{prefix.rstrip('/')}/{rel}")
+            # Flatten: upload all serialized files directly under the target prefix
+            blob = bucket.blob(f"{prefix.rstrip('/')}/{os.path.basename(lp)}")
             blob.upload_from_filename(lp)
 
 

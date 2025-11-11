@@ -43,20 +43,32 @@ echo "================================================================"
 # 1) Ingest to Parquet on GCS using dedicated script
 INGEST_OUT="${GCS_INGEST_PREFIX%/}/${RUN_NAME}"
 echo "[1/3] Ingesting to ${INGEST_OUT} ..."
+INGEST_LOG="$(mktemp -t ingest_log_XXXX.txt)"
 "${PYTHON_BIN}" "${ROOT}/data/ingest_to_parquet.py" \
   --gcs-output-uri "${INGEST_OUT}" \
   --business-id "${BUSINESS_ID}" \
   --db-user "${DB_USER:-}" \
   --db-password "${DB_PASSWORD:-}" \
   --db "${DB_NAME:-liebre_dev}" \
-  --db-schema "${DB_SCHEMA:-public}"
+  --db-schema "${DB_SCHEMA:-public}" | tee "${INGEST_LOG}"
 
 PARQUET_PATTERN="${INGEST_OUT}/parquet/*.parquet"
-# Resolve latest accounts artifact
-if command -v gsutil >/dev/null 2>&1; then
-  ACCOUNTS_URI="$(gsutil ls "${INGEST_OUT}/artifacts/accounts_*.json" | sort | tail -n 1 || true)"
-else
-  ACCOUNTS_URI=""
+# Resolve accounts artifact from ingestion output (fast path)
+ACCOUNTS_URI="$(python - <<'PY' "${INGEST_LOG}" 2>/dev/null || true
+import sys, json, re
+path=sys.argv[1]
+text=open(path, 'r', encoding='utf-8', errors='ignore').read()
+matches=list(re.finditer(r'\{[^{}]*"accounts_artifact"[^{}]*\}', text, re.DOTALL))
+if matches:
+    obj=json.loads(matches[-1].group(0))
+    print(obj.get("accounts_artifact",""))
+PY
+)"
+# Fallback to gsutil listing if parsing failed
+if [[ -z "${ACCOUNTS_URI}" ]]; then
+  if command -v gsutil >/dev/null 2>&1; then
+    ACCOUNTS_URI="$(gsutil ls "${INGEST_OUT}/artifacts/accounts_*.json" | sort | tail -n 1 || true)"
+  fi
 fi
 if [[ -z "${ACCOUNTS_URI}" ]]; then
   echo "ERROR: Could not resolve accounts artifact under ${INGEST_OUT}/artifacts/"
@@ -64,6 +76,18 @@ if [[ -z "${ACCOUNTS_URI}" ]]; then
 fi
 echo "[1/3] Ingestion complete. Parquet pattern: ${PARQUET_PATTERN}"
 echo "[1/3] Accounts artifact: ${ACCOUNTS_URI}"
+RUN_VARS_FILE="run_vars_${RUN_NAME}.env"
+cat > "${RUN_VARS_FILE}" <<EOF
+RUN_NAME="${RUN_NAME}"
+INGEST_OUT="${INGEST_OUT}"
+PARQUET_PATTERN="${PARQUET_PATTERN}"
+ACCOUNTS_URI="${ACCOUNTS_URI}"
+RETR_INDEX_DIR="${RETR_INDEX_DIR}"
+RETR_IDS_URI="${RETR_IDS_URI}"
+RETR_EMB_URI="${RETR_EMB_URI}"
+OUTPUTS_DIR="${OUTPUTS_DIR}"
+EOF
+echo "[1/3] Saved run variables to ${RUN_VARS_FILE}"
 
 # 2) Build retrieval artifacts (ScaNN) from those Parquet shards
 echo "[2/3] Building retrieval index into ${RETR_INDEX_DIR} ..."

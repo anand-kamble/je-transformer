@@ -298,6 +298,15 @@ def main() -> None:
                 return tmpdir
             # Load searcher and embeddings
             _idx_dir_local = _download_scann_dir(args.retrieval_index_dir)
+            # Validate expected ScaNN files exist at the directory root
+            _required = ["scann_searcher.pb", "serialized_partitioner.pb"]
+            _missing = [f for f in _required if not __import__("os").path.exists(__import__("os").path.join(_idx_dir_local, f))]
+            if _missing:
+                _lst = ", ".join(sorted(_missing))
+                raise RuntimeError(
+                    f"ScaNN index dir invalid: missing {_lst} in {_idx_dir_local}. "
+                    "Ensure --retrieval-index-dir points to the directory that directly contains the serialized ScaNN files."
+                )
             _retr_searcher = scann.scann_ops_pybind.load_searcher(_idx_dir_local)
             # Load embeddings and ids
             ids_bytes = _load_bytes(args.retrieval_ids_uri)
