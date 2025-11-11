@@ -263,6 +263,8 @@ def main() -> None:
     _retr_searcher = None
     _retr_proj_embs = None  # torch.Tensor on CPU [N, H_hidden]
     _normalize_queries = True
+    if not retrieval_enabled:
+        print("[retrieval] Disabled: --retrieval-index-dir not provided")
     if retrieval_enabled:
         try:
             import scann  # type: ignore
@@ -289,6 +291,7 @@ def main() -> None:
                 _, path = src.split("gs://", 1)
                 bucket_name, prefix = path.split("/", 1)
                 bucket = client.bucket(bucket_name)
+                print(f"[retrieval] Downloading ScaNN index from gs://{bucket_name}/{prefix.rstrip('/')}")
                 # Explicitly ensure required ScaNN files exist at the directory root
                 required_files = [
                     "serialized_partitioner.pb",
@@ -299,13 +302,20 @@ def main() -> None:
                 optional_files = ["dataset.npy", "hashed_dataset.npy", "datapoint_to_token.npy"]
                 for fname in required_files:
                     blob = bucket.blob(f"{prefix.rstrip('/')}/{fname}")
-                    if not blob.exists(client):
+                    exists = blob.exists(client)
+                    print(f"[retrieval]   required '{fname}': {'FOUND' if exists else 'MISSING'} at gs://{bucket_name}/{prefix.rstrip('/')}/{fname}")
+                    if not exists:
                         raise RuntimeError(
                             f"Missing required ScaNN file '{fname}' at {src}. "
                             "Ensure the index directory contains the serialized ScaNN files at its root."
                         )
                     local_path = _os.path.join(tmpdir, fname)
                     blob.download_to_filename(local_path)
+                    try:
+                        sz = _os.path.getsize(local_path)
+                    except Exception:
+                        sz = -1
+                    print(f"[retrieval]   downloaded '{fname}' to {local_path} ({sz} bytes)")
                     if _os.path.getsize(local_path) == 0:
                         raise RuntimeError(f"Downloaded zero-byte ScaNN file '{fname}' from {src}")
                 # Best-effort download of optional artifacts
@@ -314,11 +324,34 @@ def main() -> None:
                     if blob.exists(client):
                         local_path = _os.path.join(tmpdir, fname)
                         blob.download_to_filename(local_path)
+                        try:
+                            sz = _os.path.getsize(local_path)
+                        except Exception:
+                            sz = -1
+                        print(f"[retrieval]   downloaded optional '{fname}' ({sz} bytes)")
                 return tmpdir
             # Load searcher and embeddings
+            print(f"[retrieval] Using retrieval index dir: {args.retrieval_index_dir}")
             _idx_dir_local = _download_scann_dir(args.retrieval_index_dir)
             # Load ScaNN searcher directly from the directory
-            _retr_searcher = scann.scann_ops_pybind.load_searcher(_idx_dir_local)
+            print(f"[retrieval] Loading ScaNN searcher from {_idx_dir_local} ...")
+            try:
+                _retr_searcher = scann.scann_ops_pybind.load_searcher(_idx_dir_local)
+            except Exception as e_load:
+                import os as _os
+                print(f"[retrieval] ERROR loading ScaNN searcher: {e_load}")
+                try:
+                    print("[retrieval] Local index dir contents:")
+                    for f in sorted(_os.listdir(_idx_dir_local)):
+                        fp = _os.path.join(_idx_dir_local, f)
+                        try:
+                            sz = _os.path.getsize(fp)
+                        except Exception:
+                            sz = -1
+                        print(f"    {f}  ({sz} bytes)")
+                except Exception as e_ls:
+                    print(f"[retrieval] Failed to list local index dir: {e_ls}")
+                raise
             # Try to read manifest for settings and file hints
             manifest = None
             manifest_path = os.path.join(_idx_dir_local, "index_manifest.json")
@@ -326,6 +359,10 @@ def main() -> None:
                 with open(manifest_path, "r", encoding="utf-8") as mf:
                     manifest = json.load(mf)
                 _normalize_queries = bool(manifest.get("l2_normalized", True))
+                try:
+                    print(f"[retrieval] Loaded manifest: {json.dumps(manifest, indent=2)[:500]}{'...' if len(json.dumps(manifest))>500 else ''}")
+                except Exception:
+                    print("[retrieval] Loaded manifest (printing skipped due to size/encoding)")
             # Locate embeddings under the index dir (manifest → embeddings.npy → dataset.npy)
             emb_np = None
             candidates: List[str] = []
@@ -337,9 +374,13 @@ def main() -> None:
                 os.path.join(_idx_dir_local, "embeddings.npy"),
                 os.path.join(_idx_dir_local, "dataset.npy"),
             ])
+            print("[retrieval] Embedding candidates (in order):")
+            for c in candidates:
+                print(f"    {c}")
             for p in candidates:
                 if os.path.exists(p):
                     emb_np = _np.load(p)
+                    print(f"[retrieval] Using embeddings from: {p}, shape={getattr(emb_np, 'shape', None)}")
                     break
             if emb_np is None:
                 raise RuntimeError("Could not locate retrieval embeddings (tried manifest → embeddings.npy → dataset.npy).")
@@ -348,7 +389,7 @@ def main() -> None:
                 emb_t = torch.tensor(emb_np, dtype=torch.float32)  # CPU
                 proj = torch.tanh(model.enc_proj(emb_t.to(device=model.enc_proj.weight.device)))  # [N, H_hidden] on model device
                 _retr_proj_embs = proj.detach().cpu()  # keep on CPU, move to device per batch
-            print(f"Loaded retrieval artifacts from {args.retrieval_index_dir}. Embeddings: {_retr_proj_embs.shape}, top_k={int(args.retrieval_top_k)}")
+            print(f"[retrieval] Loaded. proj_embeddings={tuple(_retr_proj_embs.shape)}, top_k={int(args.retrieval_top_k)}, normalize_queries={_normalize_queries}")
         except Exception as e:
             print(f"Warning: retrieval disabled due to load error: {e}")
             retrieval_enabled = False

@@ -91,6 +91,13 @@ def main():
     parser.add_argument("--scann-reorder", type=int, default=250)
     args = parser.parse_args()
 
+    print("[build_index] Args:")
+    print(f"  parquet_pattern = {args.parquet_pattern}")
+    print(f"  output_index_dir = {args.output_index_dir}")
+    print(f"  encoder_loc = {args.encoder_loc}")
+    print(f"  max_length = {args.max_length}, batch_size = {args.batch_size}, use_cls = {bool(args.use_cls)}, l2_normalize = {bool(args.l2_normalize)}")
+    print(f"  scann: leaves={args.scann_leaves}, leaves_to_search={args.scann_leaves_to_search}, reorder={args.scann_reorder}")
+
     # GCS-only parquet expansion
     try:
         paths = _expand_gcs_glob(args.parquet_pattern)
@@ -98,10 +105,20 @@ def main():
         paths = []
     if not paths:
         raise ValueError(f"No Parquet files matched pattern: {args.parquet_pattern}")
+    print(f"[build_index] Matched {len(paths)} parquet files under pattern.")
+    if len(paths) > 5:
+        print("[build_index] First 5 files:")
+        for p in paths[:5]:
+            print(f"    {p}")
+    else:
+        print("[build_index] Files:")
+        for p in paths:
+            print(f"    {p}")
 
     # Load Parquet shards (select only the needed columns)
     frames = [pq.read_table(p, columns=["journal_entry_id", "description"]).to_pandas() for p in paths]
     df = pd.concat(frames, ignore_index=True)
+    print(f"[build_index] Loaded DataFrame with {len(df)} rows")
 
     tokenizer = AutoTokenizer.from_pretrained(args.encoder_loc, use_fast=False)
     encoder = AutoModel.from_pretrained(args.encoder_loc).eval()
@@ -112,6 +129,7 @@ def main():
     all_ids: List[str] = []
 
     # Batch iterate
+    print("[build_index] Encoding to embeddings...")
     for start in range(0, len(df), args.batch_size):
         batch_df = df.iloc[start : start + args.batch_size]
         norm_texts = [normalize_description(t or "") for t in batch_df["description"].tolist()]
@@ -129,8 +147,10 @@ def main():
             embs_np = embs_np / norms
         all_embs.append(embs_np)
         all_ids.extend([str(x) for x in batch_df["journal_entry_id"].tolist()])
+    print(f"[build_index] Built embeddings list: {len(all_embs)} batches, ids={len(all_ids)}")
 
     embs = np.concatenate(all_embs, axis=0) if all_embs else np.zeros((0, encoder.config.hidden_size), dtype=np.float32)
+    print(f"[build_index] Embedding matrix shape: {embs.shape}, dtype={embs.dtype}")
 
     # Build ScaNN index
     builder = scann.scann_ops_pybind.builder(embs, 10, "dot_product")
@@ -138,17 +158,32 @@ def main():
     # Call via getattr to avoid static analysis issues when scann stubs are unavailable
     builder = getattr(builder, "score_ah")(2, anisotropic_quantization_threshold=0.2)  # type: ignore[attr-defined]
     builder = builder.reorder(args.scann_reorder)
+    print("[build_index] Building ScaNN index ...")
     searcher = builder.build()
+    print("[build_index] ScaNN builder complete.")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Serialize ScaNN index artifacts into tmpdir
         searcher.serialize(tmpdir)
+        print(f"[build_index] Serialized ScaNN index to tmpdir: {tmpdir}")
+        try:
+            print("[build_index] Serialized files and sizes:")
+            for f in sorted(os.listdir(tmpdir)):
+                fp = os.path.join(tmpdir, f)
+                try:
+                    sz = os.path.getsize(fp)
+                except Exception:
+                    sz = -1
+                print(f"    {f}  ({sz} bytes)")
+        except Exception as e:
+            print(f"[build_index] Warning: failed to list tmpdir contents: {e}")
         # Always write aligned embeddings and ids alongside the index for simplicity
         ids_path = os.path.join(tmpdir, "ids.txt")
         with open(ids_path, "w", encoding="utf-8") as f:
             f.write("\n".join(all_ids))
         emb_path = os.path.join(tmpdir, "embeddings.npy")
         np.save(emb_path, embs)
+        print("[build_index] Wrote ids.txt and embeddings.npy")
         # Write a small manifest for downstream loaders
         manifest = {
             "encoder_loc": args.encoder_loc,
@@ -170,8 +205,22 @@ def main():
         }
         with open(os.path.join(tmpdir, "index_manifest.json"), "w", encoding="utf-8") as mf:
             json.dump(manifest, mf, indent=2)
+        print(f"[build_index] Wrote index_manifest.json: {json.dumps(manifest, indent=2)[:500]}{'...' if len(json.dumps(manifest))>500 else ''}")
         # Upload to GCS (root of index dir)
+        print(f"[build_index] Uploading serialized artifacts to {args.output_index_dir} ...")
         _upload_dir_to_gcs(tmpdir, args.output_index_dir)
+        try:
+            # List uploaded files under GCS prefix for verification
+            _, path = args.output_index_dir.split("gs://", 1)
+            bucket_name, prefix = path.split("/", 1)
+            client = storage.Client()
+            bucket = client.bucket(bucket_name)
+            names = [b.name for b in bucket.list_blobs(prefix=prefix.rstrip("/")) if not b.name.endswith("/")]
+            print("[build_index] GCS uploaded objects:")
+            for n in sorted(names):
+                print(f"    gs://{bucket_name}/{n}")
+        except Exception as e:
+            print(f"[build_index] Warning: failed to list GCS objects after upload: {e}")
 
 
 if __name__ == "__main__":
