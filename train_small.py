@@ -261,14 +261,15 @@ def main() -> None:
         learn_catalog=bool(args.trainable_catalog),
     ).to(device)
     # Optional: load retrieval artifacts once and pre-project embeddings to model hidden dim
-    retrieval_enabled = bool(args.retrieval_index_dir and args.retrieval_ids_uri and args.retrieval_embeddings_uri)
+    retrieval_enabled = bool(args.retrieval_index_dir)
     _retr_searcher = None
     _retr_proj_embs = None  # torch.Tensor on CPU [N, H_hidden]
+    _normalize_queries = True
     if retrieval_enabled:
         try:
             import scann  # type: ignore
             import numpy as _np
-            # Helper loaders supporting gs:// and local
+            # Helpers supporting gs:// and local
             def _load_bytes(path: str) -> bytes:
                 if path.startswith("gs://"):
                     from google.cloud import storage  # type: ignore
@@ -279,8 +280,9 @@ def main() -> None:
                     return blob.download_as_bytes()
                 with open(path, "rb") as f:
                     return f.read()
-            def _download_scann_dir(src: str) -> str:
-                import tempfile as _tf, os as _os
+            def _download_prefix_to_local(src: str) -> str:
+                import tempfile as _tf
+                import os as _os
                 if not src.startswith("gs://"):
                     return src
                 tmpdir = _tf.mkdtemp(prefix="scann_idx_")
@@ -289,61 +291,53 @@ def main() -> None:
                 _, path = src.split("gs://", 1)
                 bucket_name, prefix = path.split("/", 1)
                 bucket = client.bucket(bucket_name)
-                # Download required ScaNN artifacts explicitly (no searching)
-                # Match the files produced by our builder (required for loading):
-                #   - serialized_partitioner.pb (partitioner)
-                #   - scann_config.pb (config)
-                #   - scann_assets.pbtxt (assets manifest)
-                #   - ah_codebook.pb (AH codebook, required due to score_ah() in builder)
-                #   - dataset.npy (embedding dataset; referenced by assets)
-                required_files = [
-                    "serialized_partitioner.pb",
-                    "scann_config.pb",
-                    "scann_assets.pbtxt",
-                    "ah_codebook.pb",
-                    "dataset.npy",
-                ]
-                optional_files = ["hashed_dataset.npy", "datapoint_to_token.npy"]
-                for fname in required_files:
-                    blob = bucket.blob(f"{prefix.rstrip('/')}/{fname}")
-                    if not blob.exists(client):
-                        raise RuntimeError(
-                            f"Missing required ScaNN file '{fname}' at {src}. "
-                            "Ensure the index directory contains the serialized ScaNN files at its root."
-                        )
-                    dest = _os.path.join(tmpdir, fname)
-                    blob.download_to_filename(dest)
-                # Best-effort download of optional artifacts
-                for fname in optional_files:
-                    blob = bucket.blob(f"{prefix.rstrip('/')}/{fname}")
-                    if blob.exists(client):
-                        dest = _os.path.join(tmpdir, fname)
-                        blob.download_to_filename(dest)
+                for blob in bucket.list_blobs(prefix=prefix.rstrip("/")):
+                    if blob.name.endswith("/"):
+                        continue
+                    rel_base = prefix.rstrip("/") + "/"
+                    rel = blob.name[len(rel_base):] if blob.name.startswith(rel_base) else os.path.basename(blob.name)
+                    dst = _os.path.join(tmpdir, rel)
+                    _os.makedirs(_os.path.dirname(dst), exist_ok=True)
+                    blob.download_to_filename(dst)
                 return tmpdir
             # Load searcher and embeddings
-            _idx_dir_local = _download_scann_dir(args.retrieval_index_dir)
-            # Validate expected ScaNN files exist at the directory root
-            _required = ["serialized_partitioner.pb", "scann_config.pb", "scann_assets.pbtxt"]
-            _missing = [f for f in _required if not __import__("os").path.exists(__import__("os").path.join(_idx_dir_local, f))]
-            if _missing:
-                _lst = ", ".join(sorted(_missing))
-                raise RuntimeError(
-                    f"ScaNN index dir invalid: missing {_lst} in {_idx_dir_local}. "
-                    "Ensure --retrieval-index-dir points to the directory that directly contains the serialized ScaNN files."
-                )
+            _idx_dir_local = _download_prefix_to_local(args.retrieval_index_dir)
+            # Load ScaNN searcher directly from the directory
             _retr_searcher = scann.scann_ops_pybind.load_searcher(_idx_dir_local)
-            # Load embeddings and ids
-            ids_bytes = _load_bytes(args.retrieval_ids_uri)
-            ids_text = ids_bytes.decode("utf-8")
-            _ = [line for line in ids_text.splitlines() if line.strip()]  # kept for alignment checks if needed later
-            emb_bytes = _load_bytes(args.retrieval_embeddings_uri)
-            emb_np = _np.load(__import__("io").BytesIO(emb_bytes))  # [N, H_enc]
+            # Try to read manifest for settings and file hints
+            manifest = None
+            manifest_path = os.path.join(_idx_dir_local, "index_manifest.json")
+            if os.path.exists(manifest_path):
+                with open(manifest_path, "r", encoding="utf-8") as mf:
+                    manifest = json.load(mf)
+                _normalize_queries = bool(manifest.get("l2_normalized", True))
+            # Locate embeddings: prefer CLI override, else manifest, else common defaults
+            emb_np = None
+            if args.retrieval_embeddings_uri:
+                emb_bytes = _load_bytes(args.retrieval_embeddings_uri)
+                emb_np = _np.load(__import__("io").BytesIO(emb_bytes))  # [N, H_enc]
+            else:
+                candidates: List[str] = []
+                if manifest and isinstance(manifest.get("files", {}), dict):
+                    emb_rel = manifest["files"].get("embeddings")
+                    if emb_rel:
+                        candidates.append(os.path.join(_idx_dir_local, emb_rel))
+                candidates.extend([
+                    os.path.join(_idx_dir_local, "embeddings.npy"),
+                    os.path.join(_idx_dir_local, "dataset.npy"),
+                ])
+                for p in candidates:
+                    if os.path.exists(p):
+                        emb_np = _np.load(p)
+                        break
+            if emb_np is None:
+                raise RuntimeError("Could not locate retrieval embeddings (tried manifest → embeddings.npy → dataset.npy).")
             # Project to hidden_dim using the model's enc_proj and tanh, on CPU and no grad
             with torch.no_grad():
                 emb_t = torch.tensor(emb_np, dtype=torch.float32)  # CPU
                 proj = torch.tanh(model.enc_proj(emb_t.to(device=model.enc_proj.weight.device)))  # [N, H_hidden] on model device
                 _retr_proj_embs = proj.detach().cpu()  # keep on CPU, move to device per batch
-            print(f"Loaded retrieval artifacts. Embeddings: {_retr_proj_embs.shape}, top_k={int(args.retrieval_top_k)}")
+            print(f"Loaded retrieval artifacts from {args.retrieval_index_dir}. Embeddings: {_retr_proj_embs.shape}, top_k={int(args.retrieval_top_k)}")
         except Exception as e:
             print(f"Warning: retrieval disabled due to load error: {e}")
             retrieval_enabled = False
@@ -356,7 +350,8 @@ def main() -> None:
             enc_out = model.encoder(input_ids=_inp_ids, attention_mask=_attn)
             pooled = enc_out.last_hidden_state[:, 0, :] if args.retrieval_use_cls else mean_pool(enc_out.last_hidden_state, _attn)
             q_cpu = pooled.detach().cpu()
-            q_cpu = q_cpu / (q_cpu.norm(dim=1, keepdim=True) + 1e-8)
+            if _normalize_queries:
+                q_cpu = q_cpu / (q_cpu.norm(dim=1, keepdim=True) + 1e-8)
             nbrs, _ = _retr_searcher.search_batched(q_cpu.numpy(), final_num_neighbors=int(args.retrieval_top_k))
             mem_list = []
             for i in range(len(nbrs)):

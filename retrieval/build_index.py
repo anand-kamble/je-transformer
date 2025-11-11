@@ -18,13 +18,15 @@ import os
 import sys
 import tempfile
 import fnmatch
-from typing import Dict, List
+from typing import List
 
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import scann
 import torch
+import json
+import shutil
 from google.cloud import storage
 from transformers import AutoModel, AutoTokenizer
 
@@ -48,19 +50,31 @@ def mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> 
     return summed / denom
 
 
-def upload_dir_to_gcs(local_dir: str, gcs_dir: str) -> None:
-    if not gcs_dir.startswith("gs://"):
-        raise ValueError("gcs_dir must start with gs://")
-    client = storage.Client()
-    _, path = gcs_dir.split("gs://", 1)
-    bucket_name, prefix = path.split("/", 1)
-    bucket = client.bucket(bucket_name)
-    for root, _, files in os.walk(local_dir):
-        for f in files:
-            lp = os.path.join(root, f)
-            # Flatten: upload all serialized files directly under the target prefix
-            blob = bucket.blob(f"{prefix.rstrip('/')}/{os.path.basename(lp)}")
-            blob.upload_from_filename(lp)
+def _export_dir(local_dir: str, target_dir: str) -> None:
+    """
+    Export a directory tree either to a local path (copy) or to GCS (upload),
+    preserving the relative directory structure.
+    """
+    if target_dir.startswith("gs://"):
+        client = storage.Client()
+        _, path = target_dir.split("gs://", 1)
+        bucket_name, prefix = path.split("/", 1)
+        bucket = client.bucket(bucket_name)
+        for root, _, files in os.walk(local_dir):
+            for f in files:
+                lp = os.path.join(root, f)
+                rel = os.path.relpath(lp, start=local_dir).replace(os.sep, "/")
+                blob = bucket.blob(f"{prefix.rstrip('/')}/{rel}")
+                blob.upload_from_filename(lp)
+    else:
+        os.makedirs(target_dir, exist_ok=True)
+        for root, _, files in os.walk(local_dir):
+            for f in files:
+                src = os.path.join(root, f)
+                rel = os.path.relpath(src, start=local_dir)
+                dst = os.path.join(target_dir, rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
 
 
 def write_ids_to_gcs(ids: List[str], gcs_uri: str) -> None:
@@ -145,21 +159,53 @@ def main():
     embs = np.concatenate(all_embs, axis=0) if all_embs else np.zeros((0, encoder.config.hidden_size), dtype=np.float32)
 
     # Build ScaNN index
-    searcher = scann.scann_ops_pybind.builder(embs, 10, "dot_product") \
-        .tree(num_leaves=args.scann_leaves, num_leaves_to_search=args.scann_leaves_to_search) \
-        .score_ah(2, anisotropic_quantization_threshold=0.2) \
-        .reorder(args.scann_reorder) \
-        .build()
+    builder = scann.scann_ops_pybind.builder(embs, 10, "dot_product")
+    builder = builder.tree(num_leaves=args.scann_leaves, num_leaves_to_search=args.scann_leaves_to_search)
+    # Call via getattr to avoid static analysis issues when scann stubs are unavailable
+    builder = getattr(builder, "score_ah")(2, anisotropic_quantization_threshold=0.2)  # type: ignore[attr-defined]
+    builder = builder.reorder(args.scann_reorder)
+    searcher = builder.build()
 
     with tempfile.TemporaryDirectory() as tmpdir:
+        # Serialize ScaNN index artifacts into tmpdir
         searcher.serialize(tmpdir)
-        upload_dir_to_gcs(tmpdir, args.output_index_dir)
+        # Always write aligned embeddings and ids alongside the index for simplicity
+        ids_path = os.path.join(tmpdir, "ids.txt")
+        with open(ids_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(all_ids))
+        emb_path = os.path.join(tmpdir, "embeddings.npy")
+        np.save(emb_path, embs)
+        # Write a small manifest for downstream loaders
+        manifest = {
+            "encoder_loc": args.encoder_loc,
+            "pooling": "cls" if args.use_cls else "mean",
+            "l2_normalized": bool(args.l2_normalize),
+            "metric": "dot_product",
+            "hidden_size": int(embs.shape[1]) if embs.size else int(encoder.config.hidden_size),
+            "num_vectors": int(embs.shape[0]),
+            "max_length": int(args.max_length),
+            "scann": {
+                "leaves": int(args.scann_leaves),
+                "leaves_to_search": int(args.scann_leaves_to_search),
+                "reorder": int(args.scann_reorder),
+            },
+            "files": {
+                "ids": "ids.txt",
+                "embeddings": "embeddings.npy",
+            },
+        }
+        with open(os.path.join(tmpdir, "index_manifest.json"), "w", encoding="utf-8") as mf:
+            json.dump(manifest, mf, indent=2)
+        # Export entire directory to the target (local or GCS), preserving structure
+        _export_dir(tmpdir, args.output_index_dir)
 
+    # Back-compat: also ship separate ids and embeddings to user-provided URIs if specified
     write_ids_to_gcs(all_ids, args.output_ids_uri)
     if args.output_embeddings_uri:
         if not args.output_embeddings_uri.startswith("gs://"):
             raise ValueError("--output-embeddings-uri must start with gs://")
-        client = storage.Client()
+        from google.cloud import storage as gcs_storage  # avoid linter false-positive on unbound name
+        client = gcs_storage.Client()
         _, path = args.output_embeddings_uri.split("gs://", 1)
         bucket_name, blob_name = path.split("/", 1)
         bucket = client.bucket(bucket_name)
