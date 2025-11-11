@@ -3,6 +3,7 @@ from __future__ import annotations
 import glob
 import json
 from typing import Any, Dict, List, Tuple
+import fnmatch
 
 import numpy as np
 import pandas as pd
@@ -48,13 +49,49 @@ class ParquetJEDataset(Dataset):
         max_length: int = 128,
         max_lines: int = 8,
     ) -> None:
-        self.files: List[str] = sorted(glob.glob(pattern)) if not pattern.startswith("gs://") else [pattern]
+        # Resolve parquet files
+        if not pattern.startswith("gs://"):
+            self.files = sorted(glob.glob(pattern))
+        else:
+            # GCS path; expand wildcards (supports "*.parquet") by listing with GCS API
+            bucket_and_path = pattern[len("gs://") :]
+            if "*" in bucket_and_path or "?" in bucket_and_path:
+                try:
+                    from google.cloud import storage  # type: ignore
+                    bucket_name, path_pattern = bucket_and_path.split("/", 1)
+                    prefix = path_pattern.rsplit("/", 1)[0]  # up to last /
+                    client = storage.Client()
+                    bucket = client.bucket(bucket_name)
+                    blobs = list(bucket.list_blobs(prefix=prefix.rstrip("/")))
+                    candidates = [f"gs://{bucket_name}/{b.name}" for b in blobs if b.name.endswith(".parquet")]
+                    self.files = sorted([p for p in candidates if fnmatch.fnmatch(p, pattern)])
+                except Exception:
+                    # Fallback: try reading directory without wildcard
+                    self.files = [f"gs://{bucket_and_path.rsplit('/', 1)[0]}"]
+            else:
+                # Single file or directory URI
+                self.files = [pattern]
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_loc, use_fast=False)
         self.max_length = int(max_length)
         self.max_lines = int(max_lines)
         if not self.files:
             raise ValueError(f"No Parquet files matched pattern: {pattern}")
-        dfs = [pd.read_parquet(p) for p in self.files] if not pattern.startswith("gs://") else [pd.read_parquet(pattern)]
+        # Read dataframes
+        if not pattern.startswith("gs://"):
+            dfs = [pd.read_parquet(p) for p in self.files]
+        else:
+            if len(self.files) == 1 and self.files[0].endswith("*.parquet"):
+                dfs = [pd.read_parquet(self.files[0])]
+            elif len(self.files) == 1 and self.files[0].endswith("/parquet"):
+                dfs = [pd.read_parquet(self.files[0])]
+            elif len(self.files) == 1 and self.files[0].endswith("/"):
+                dfs = [pd.read_parquet(self.files[0])]
+            elif len(self.files) == 1 and not any(self.files[0].endswith(s) for s in [".parquet"]):
+                # Directory
+                dfs = [pd.read_parquet(self.files[0])]
+            else:
+                # List of file URIs
+                dfs = [pd.read_parquet(f) for f in self.files]
         self.df = pd.concat(dfs, ignore_index=True)
 
     def __len__(self) -> int:
