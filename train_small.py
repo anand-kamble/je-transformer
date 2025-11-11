@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import argparse
 import json
 import os
@@ -8,11 +9,13 @@ import shutil
 import tempfile
 from typing import Any, Dict, List, Optional
 
+
 import numpy as np
 import torch
 import wandb
 from dotenv import load_dotenv
 from torch.utils.data import DataLoader, Subset
+
 
 from data.ingest_to_parquet import (AccountCatalog, build_join_statement,
                                     create_engine_with_psql, date_features,
@@ -25,7 +28,9 @@ from models.losses import (SetF1Metric, coverage_penalty, flow_aux_loss,
                            pointer_loss, side_loss, stop_loss)
 from train.dataset import ParquetJEDataset, collate_fn
 
+
 load_dotenv(override=True)
+
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -37,10 +42,12 @@ def set_seed(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
+
 def load_json_from_uri(uri: str) -> Dict[str, Any]:
     print(f"Loading JSON from URI: {uri}")
     if uri.startswith("gs://"):
         from google.cloud import storage
+
 
         client = storage.Client()
         _, path = uri.split("gs://", 1)
@@ -52,6 +59,7 @@ def load_json_from_uri(uri: str) -> Dict[str, Any]:
         return json.load(f)
 
 
+
 def build_catalog_embeddings(artifact: Dict[str, Any], emb_dim: int, device: torch.device) -> torch.Tensor:
     accounts = artifact["accounts"]
     number = [a.get("number", "") for a in accounts]
@@ -60,6 +68,7 @@ def build_catalog_embeddings(artifact: Dict[str, Any], emb_dim: int, device: tor
     encoder = CatalogEncoder(emb_dim=emb_dim)
     embs = encoder({"number": number, "name": name, "nature": nature})  # [C, emb_dim]
     return embs.to(device=device, dtype=torch.float32).detach()
+
 
 
 def main() -> None:
@@ -102,7 +111,7 @@ def main() -> None:
     # Tiny defaults for quick runs
     parser.add_argument("--encoder", type=str, default="prajjwal1/bert-tiny", help="Small HF encoder for speed")
     parser.add_argument("--max-length", type=int, default=64)
-    parser.add_argument("--max-lines", type=int, default=32)
+    parser.add_argument("--max-lines", type=int, default=40)
     parser.add_argument("--hidden-dim", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=30)
@@ -116,17 +125,45 @@ def main() -> None:
     parser.add_argument("--no-wandb", action="store_true", help="Disable W&B tracking")
     args = parser.parse_args()
 
+
     if args.seed:
         set_seed(int(args.seed))
 
-    # Initialize wandb
+    # Generate unique run name/ID EARLY (before any file operations)
     wandb_enabled = not args.no_wandb
-    run_name = None
+    if wandb_enabled:
+        # Pre-generate run ID so we can use it for directory naming
+        run_id = wandb.util.generate_id()
+        run_name = args.wandb_name or run_id
+    else:
+        # If wandb disabled, fallback to timestamp
+        import time
+        run_name = time.strftime("%Y%m%d-%H%M%S")
+    
+    # Update ALL output directories to use run_name
+    # 1. Update main output directory
+    if not args.output_dir.startswith("gs://"):
+        args.output_dir = os.path.join(args.output_dir, run_name)
+        os.makedirs(args.output_dir, exist_ok=True)
+    else:
+        # For GCS, append run_name to path
+        args.output_dir = f"{args.output_dir.rstrip('/')}/{run_name}"
+    
+    # 2. Update ingestion output directory
+    if args.gcs_output_uri:
+        if not args.gcs_output_uri.startswith("gs://"):
+            args.gcs_output_uri = os.path.join(args.gcs_output_uri, run_name)
+            os.makedirs(args.gcs_output_uri, exist_ok=True)
+        else:
+            args.gcs_output_uri = f"{args.gcs_output_uri.rstrip('/')}/{run_name}"
+
+    # Initialize wandb with the pre-generated run name/ID
     if wandb_enabled:
         try:
             wandb.init(
                 project=args.wandb_project,
-                name=args.wandb_name,
+                name=run_name,
+                id=run_id,
                 entity=args.wandb_entity,
                 config={
                     "encoder": args.encoder,
@@ -142,11 +179,10 @@ def main() -> None:
                 },
                 job_type="training",
             )
+            # Verify run_name matches
             run_name = wandb.run.name
-            # Use run_name to create unique output directory
-            if not args.output_dir.startswith("gs://"):
-                args.output_dir = os.path.join(args.output_dir, run_name)
-                os.makedirs(args.output_dir, exist_ok=True)
+            print(f"Initialized wandb run: {run_name}")
+            print(f"All outputs will be saved to: {args.output_dir}")
 
             # Define custom metrics for better visualization
             wandb.define_metric("step")
@@ -156,15 +192,10 @@ def main() -> None:
         except Exception as e:
             print(f"Warning: Failed to initialize wandb: {e}")
             wandb_enabled = False
-    else:
-        # If wandb disabled, fallback to timestamp folder for uniqueness
-        import time
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        if not args.output_dir.startswith("gs://"):
-            args.output_dir = os.path.join(args.output_dir, ts)
-            os.makedirs(args.output_dir, exist_ok=True)
+
 
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu"))
+
 
     # Optional end-to-end ingestion if GCS output is provided (recommended for full flow)
     parquet_pattern = args.parquet_pattern
@@ -180,6 +211,7 @@ def main() -> None:
         import json as _json
         import time
 
+
         import pandas as _pd
         import sqlalchemy as sa
         metadata = sa.MetaData()
@@ -190,6 +222,7 @@ def main() -> None:
             if args.gcs_output_uri.startswith("gs://"):
                 from google.cloud import storage
                 client = storage.Client()
+                # Store in run_name subdirectory
                 accounts_artifact_path = f"{args.gcs_output_uri.rstrip('/')}/artifacts/accounts_{ts}.json"
                 write_gcs_json(accounts_artifact_path, catalog.to_artifact(), client)
                 _ = write_parquet_shards(
@@ -206,7 +239,7 @@ def main() -> None:
                 )
                 parquet_pattern = f"{args.gcs_output_uri.rstrip('/')}/parquet/*.parquet"
             else:
-                # Local directory output
+                # Local directory output - already updated to include run_name
                 base_dir = args.gcs_output_uri.rstrip("/")
                 os.makedirs(os.path.join(base_dir, "artifacts"), exist_ok=True)
                 os.makedirs(os.path.join(base_dir, "parquet"), exist_ok=True)
@@ -233,6 +266,7 @@ def main() -> None:
                 debit_amounts: List[float] = []
                 credit_amounts: List[float] = []
 
+
                 def write_shard(rows: List[Dict[str, Any]], si: int) -> str:
                     out_path = os.path.join(base_dir, "parquet", f"part-{si:05d}-{ts}.parquet")
                     df = _pd.DataFrame(rows)
@@ -241,6 +275,7 @@ def main() -> None:
                             df[col] = df[col].apply(lambda x: list(x) if isinstance(x, list) else (list(x) if hasattr(x, "__iter__") and not isinstance(x, (str, bytes)) else []))
                     df.to_parquet(out_path, engine="pyarrow", index=False)
                     return out_path
+
 
                 def flush_current():
                     nonlocal shard_index, shard_records, current_rows
@@ -266,6 +301,7 @@ def main() -> None:
                         shard_index += 1
                         shard_records = 0
                         current_rows = []
+
 
                 for r in result:
                     je_id = str(r.journal_entry_id)
@@ -309,6 +345,7 @@ def main() -> None:
                         credit_accounts.append(int(idx))
                         credit_amounts.append(credit_val)
 
+
                 flush_current()
                 if current_rows:
                     _ = write_shard(current_rows, shard_index)
@@ -317,6 +354,8 @@ def main() -> None:
                 entries_json_path = os.path.join(base_dir, "artifacts", f"journal_entries_{ts}.json")
                 with open(entries_json_path, "w", encoding="utf-8") as jf:
                     _json.dump(all_entries, jf, ensure_ascii=False, indent=2)
+                print(f"Ingestion complete. Data saved to: {base_dir}")
+
 
     # Dataset and small subset
     full_ds = ParquetJEDataset(parquet_pattern, tokenizer_loc=args.encoder, max_length=args.max_length, max_lines=args.max_lines)
@@ -326,8 +365,10 @@ def main() -> None:
     ds = Subset(full_ds, idx)
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=collate_fn)
 
+
     artifact = load_json_from_uri(accounts_artifact_path)
     cat_emb = build_catalog_embeddings(artifact, emb_dim=args.hidden_dim, device=device)
+
 
     model = JEModel(encoder_loc=args.encoder, hidden_dim=args.hidden_dim, max_lines=args.max_lines, temperature=1.0).to(device)
     
@@ -340,6 +381,7 @@ def main() -> None:
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     metric_set_f1 = SetF1Metric()
+
 
     model.train()
     step = 0
@@ -357,6 +399,7 @@ def main() -> None:
             currency = features["currency"]
             journal_entry_type = features["journal_entry_type"]
 
+
             target_account_idx = targets["target_account_idx"].to(device)
             target_side_id = targets["target_side_id"].to(device)
             target_stop_id = targets["target_stop_id"].to(device)
@@ -364,6 +407,7 @@ def main() -> None:
             debit_weights = targets["debit_weights"].to(device)
             credit_indices = targets["credit_indices"].to(device)
             credit_weights = targets["credit_weights"].to(device)
+
 
             optimizer.zero_grad(set_to_none=True)
             outputs = model(
@@ -382,10 +426,12 @@ def main() -> None:
             pointer_probs = torch.softmax(outputs["pointer_logits"], dim=-1)
             side_probs = torch.softmax(outputs["side_logits"], dim=-1)
 
+
             # Pass probabilities instead of logits where applicable
             pl = pointer_loss(outputs["pointer_logits"], target_account_idx, ignore_index=-1)
             sl = side_loss(outputs["side_logits"], target_side_id, ignore_index=-1)
             stl = stop_loss(outputs["stop_logits"], target_stop_id, ignore_index=-1)
+
 
             # These use the pre-computed probabilities
             cov = coverage_penalty(outputs["pointer_logits"], probs=pointer_probs) * 0.01     # Modify function
@@ -399,6 +445,7 @@ def main() -> None:
                 pointer_probs=pointer_probs,
                 side_probs=side_probs,
             ) * float(args.flow_weight)
+
 
             total = pl + sl + stl + cov + flow
             total.backward()  # No retain_graph needed!
@@ -415,6 +462,7 @@ def main() -> None:
                 "flow_loss": flow.item(),
                 "set_f1": metric_set_f1.result().item() if step % 20 == 0 else (last_metrics["set_f1"] if last_metrics else 0.0),
             }
+
 
             if step % 100 == 0:
                 metric_set_f1.update_state(
@@ -494,6 +542,7 @@ def main() -> None:
             metadata_path = os.path.join(tmpdir, "training_metadata.json")
             with open(metadata_path, "w") as f:
                 json.dump({
+                    "run_name": run_name,
                     "epoch": epoch + 1,
                     "step": step,
                     "total_steps": len(dl) * (epoch + 1),
@@ -533,21 +582,36 @@ def main() -> None:
                 except Exception as e:
                     print(f"Warning: Failed to log wandb artifact: {e}")
             
-            # 6. Also save to local/gs:// for backward compatibility
-            os.makedirs(args.output_dir, exist_ok=True) if not args.output_dir.startswith("gs://") else None
-            local_ckpt_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}.pt") if not args.output_dir.startswith("gs://") else f"/tmp/checkpoint_epoch_{epoch+1}.pt"
-            
-            # Copy checkpoint to final location
-            shutil.copy2(ckpt_path, local_ckpt_path)
-            
+            # 6. Also save to local/gs:// (in run_name directory)
             if args.output_dir.startswith("gs://"):
                 from google.cloud import storage
+
 
                 client = storage.Client()
                 _, path = args.output_dir.split("gs://", 1)
                 bucket_name, prefix = path.split("/", 1)
-                blob = client.bucket(bucket_name).blob(f"{prefix.rstrip('/')}/checkpoint_epoch_{epoch+1}.pt")
-                blob.upload_from_filename(local_ckpt_path)
+                
+                # Upload all checkpoint files
+                for fname, fpath in [
+                    (f"checkpoint_epoch_{epoch+1}.pt", ckpt_path),
+                    ("config.json", config_path),
+                    ("accounts_artifact.json", accounts_path),
+                    ("training_metadata.json", metadata_path),
+                ]:
+                    blob = client.bucket(bucket_name).blob(f"{prefix.rstrip('/')}/{fname}")
+                    blob.upload_from_filename(fpath)
+                print(f"Epoch {epoch+1} checkpoint uploaded to {args.output_dir}")
+            else:
+                # Copy all checkpoint files to local directory
+                for fname, fpath in [
+                    (f"checkpoint_epoch_{epoch+1}.pt", ckpt_path),
+                    ("config.json", config_path),
+                    ("accounts_artifact.json", accounts_path),
+                    ("training_metadata.json", metadata_path),
+                ]:
+                    shutil.copy2(fpath, os.path.join(args.output_dir, fname))
+                print(f"Epoch {epoch+1} checkpoint saved to {args.output_dir}")
+
 
     # Save final checkpoint
     if args.output_dir.startswith("gs://"):
@@ -555,17 +619,17 @@ def main() -> None:
         torch.save({"model": model.state_dict()}, tmp)
         from google.cloud import storage
 
+
         client = storage.Client()
         _, path = args.output_dir.split("gs://", 1)
         bucket_name, prefix = path.split("/", 1)
         blob = client.bucket(bucket_name).blob(f"{prefix.rstrip('/')}/model_state.pt")
         blob.upload_from_filename(tmp)
-        print(f"Uploaded checkpoint to {args.output_dir}")
+        print(f"Final checkpoint uploaded to {args.output_dir}")
     else:
-        os.makedirs(args.output_dir, exist_ok=True)
         ckpt = os.path.join(args.output_dir, "model_state.pt")
         torch.save({"model": model.state_dict()}, ckpt)
-        print(f"Checkpoint written to {ckpt}")
+        print(f"Final checkpoint written to {ckpt}")
     
     # Log final summary to wandb
     if wandb_enabled:
@@ -574,10 +638,18 @@ def main() -> None:
                 "final_epoch": args.epochs,
                 "final_step": step,
                 "final_set_f1": metric_set_f1.result().item(),
+                "output_directory": args.output_dir,
             })
             wandb.finish()
         except Exception as e:
             print(f"Warning: Failed to update wandb summary: {e}")
+    
+    print(f"\n{'='*60}")
+    print(f"Training complete!")
+    print(f"Run name: {run_name}")
+    print(f"All outputs saved to: {args.output_dir}")
+    print(f"{'='*60}")
+
 
 
 if __name__ == "__main__":
