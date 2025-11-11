@@ -357,7 +357,7 @@ def write_parquet_shards(
         nonlocal shard_index, shard_records, records_written, current_rows
         if current_je_id is None:
             return
-        print(f"[ingest] Flushing JE {current_je.get('journal_entry_id')} (rows_in_shard={len(current_rows)}, shard_index={shard_index})")
+        # print(f"[ingest] Flushing JE {current_je.get('journal_entry_id')} (rows_in_shard={len(current_rows)}, shard_index={shard_index})")
         row = {
             "journal_entry_id": current_je.get("journal_entry_id"),
             "business_id": current_je.get("business_id"),
