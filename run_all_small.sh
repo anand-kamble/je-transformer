@@ -40,18 +40,30 @@ echo "Retrieval dir: ${RETRIEVAL_PREFIX}"
 echo "Outputs dir:   ${OUTPUTS_DIR}"
 echo "================================================================"
 
-# 1) Ingest to Parquet on GCS ONLY (epochs=0). We pass --wandb-name to fix run folder name.
-echo "[1/3] Ingesting to ${GCS_INGEST_PREFIX}/${RUN_NAME} ..."
-"${PYTHON_BIN}" "${ROOT}/train_small.py" \
-  --gcs-output-uri "${GCS_INGEST_PREFIX}" \
+# 1) Ingest to Parquet on GCS using dedicated script
+INGEST_OUT="${GCS_INGEST_PREFIX%/}/${RUN_NAME}"
+echo "[1/3] Ingesting to ${INGEST_OUT} ..."
+"${PYTHON_BIN}" "${ROOT}/data/ingest_to_parquet.py" \
+  --gcs-output-uri "${INGEST_OUT}" \
   --business-id "${BUSINESS_ID}" \
-  --encoder "${ENCODER}" \
-  --epochs 0 \
-  --limit 0 \
-  --wandb-name "${RUN_NAME}"
+  --db-user "${DB_USER:-}" \
+  --db-password "${DB_PASSWORD:-}" \
+  --db "${DB_NAME:-liebre_dev}" \
+  --db-schema "${DB_SCHEMA:-public}"
 
-PARQUET_PATTERN="${GCS_INGEST_PREFIX%/}/${RUN_NAME}/parquet/*.parquet"
+PARQUET_PATTERN="${INGEST_OUT}/parquet/*.parquet"
+# Resolve latest accounts artifact
+if command -v gsutil >/dev/null 2>&1; then
+  ACCOUNTS_URI="$(gsutil ls "${INGEST_OUT}/artifacts/accounts_*.json" | sort | tail -n 1 || true)"
+else
+  ACCOUNTS_URI=""
+fi
+if [[ -z "${ACCOUNTS_URI}" ]]; then
+  echo "ERROR: Could not resolve accounts artifact under ${INGEST_OUT}/artifacts/"
+  exit 1
+fi
 echo "[1/3] Ingestion complete. Parquet pattern: ${PARQUET_PATTERN}"
+echo "[1/3] Accounts artifact: ${ACCOUNTS_URI}"
 
 # 2) Build retrieval artifacts (ScaNN) from those Parquet shards
 echo "[2/3] Building retrieval index into ${RETR_INDEX_DIR} ..."
@@ -78,6 +90,8 @@ echo "[3/3] Training model with retrieval ..."
   --lr "${LR}" \
   --output-dir "${OUTPUTS_DIR}" \
   --wandb-name "${RUN_NAME}" \
+  --parquet-pattern "${PARQUET_PATTERN}" \
+  --accounts-artifact "${ACCOUNTS_URI}" \
   --limit "${LIMIT}" \
   --pointer-temp "${POINTER_TEMP}" \
   --pointer-scale-init "${POINTER_SCALE_INIT}" \

@@ -17,11 +17,7 @@ from dotenv import load_dotenv
 from torch.utils.data import DataLoader, Subset
 
 
-from data.ingest_to_parquet import (AccountCatalog, build_join_statement,
-                                    create_engine_with_psql, date_features,
-                                    normalize_amounts,
-                                    reflect_or_define_tables, write_gcs_json,
-                                    write_parquet_shards)
+# Ingestion is now handled by data/ingest_to_parquet.py (external step)
 from models.catalog_encoder import CatalogEncoder
 from models.je_model_torch import JEModel, mean_pool
 from models.losses import (SetF1Metric, coverage_penalty, flow_aux_loss,
@@ -235,164 +231,10 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu"))
 
 
-    # Optional end-to-end ingestion if GCS output is provided (recommended for full flow)
+    # Upstream ingestion has moved to data/ingest_to_parquet.py.
+    # Expect prebuilt Parquet shards and accounts artifact via CLI.
     parquet_pattern = args.parquet_pattern
     accounts_artifact_path = args.accounts_artifact
-    if args.gcs_output_uri:
-        if not args.instance or not args.db_user:
-            raise ValueError("--instance and --db-user are required (or set DB_INSTANCE_CONNECTION_NAME/DB_USER) to run ingestion")
-        engine = create_engine_with_psql(
-            database_name=args.db,
-            db_user=args.db_user,
-            db_password=args.db_password,
-        )
-        import json as _json
-        import time
-
-
-        import pandas as _pd
-        import sqlalchemy as sa
-        metadata = sa.MetaData()
-        tables = reflect_or_define_tables(metadata, engine=engine, schema=os.environ.get("DB_SCHEMA", "public"))
-        with engine.connect() as conn:
-            catalog = AccountCatalog.build(conn, tables, business_id=args.business_id)
-            ts = time.strftime("%Y%m%d-%H%M%S")
-            if args.gcs_output_uri.startswith("gs://"):
-                from google.cloud import storage
-                client = storage.Client()
-                # Store in run_name subdirectory
-                accounts_artifact_path = f"{args.gcs_output_uri.rstrip('/')}/artifacts/accounts_{ts}.json"
-                write_gcs_json(accounts_artifact_path, catalog.to_artifact(), client)
-                _ = write_parquet_shards(
-                    conn=conn,
-                    tables=tables,
-                    catalog=catalog,
-                    gcs_output_uri=args.gcs_output_uri,
-                    shard_size=int(args.shard_size),
-                    filters={
-                        "business_id": args.business_id,
-                        "start_date": None if not args.start_date else __import__("datetime").date.fromisoformat(args.start_date),
-                        "end_date": None if not args.end_date else __import__("datetime").date.fromisoformat(args.end_date),
-                    },
-                )
-                parquet_pattern = f"{args.gcs_output_uri.rstrip('/')}/parquet/*.parquet"
-            else:
-                # Local directory output - already updated to include run_name
-                base_dir = args.gcs_output_uri.rstrip("/")
-                os.makedirs(os.path.join(base_dir, "artifacts"), exist_ok=True)
-                os.makedirs(os.path.join(base_dir, "parquet"), exist_ok=True)
-                accounts_artifact_path = os.path.join(base_dir, "artifacts", f"accounts_{ts}.json")
-                with open(accounts_artifact_path, "w", encoding="utf-8") as f:
-                    _json.dump(catalog.to_artifact(), f, ensure_ascii=False, indent=2)
-                # Stream rows and write parquet shards locally
-                shard_size = int(args.shard_size)
-                shard_index = 0
-                shard_records = 0
-                current_rows: List[Dict[str, Any]] = []
-                all_entries: List[Dict[str, Any]] = []
-                stmt = build_join_statement(
-                    tables=tables,
-                    business_id=args.business_id,
-                    start_date=None if not args.start_date else __import__("datetime").date.fromisoformat(args.start_date),
-                    end_date=None if not args.end_date else __import__("datetime").date.fromisoformat(args.end_date),
-                )
-                result = conn.execute(stmt.execution_options(stream_results=True))
-                current_je_id: Optional[str] = None
-                current_je: Dict[str, Any] = {}
-                debit_accounts: List[int] = []
-                credit_accounts: List[int] = []
-                debit_amounts: List[float] = []
-                credit_amounts: List[float] = []
-
-
-                def write_shard(rows: List[Dict[str, Any]], si: int) -> str:
-                    out_path = os.path.join(base_dir, "parquet", f"part-{si:05d}-{ts}.parquet")
-                    df = _pd.DataFrame(rows)
-                    for col in ("debit_accounts", "credit_accounts", "debit_amounts_norm", "credit_amounts_norm"):
-                        if col in df.columns:
-                            df[col] = df[col].apply(lambda x: list(x) if isinstance(x, list) else (list(x) if hasattr(x, "__iter__") and not isinstance(x, (str, bytes)) else []))
-                    df.to_parquet(out_path, engine="pyarrow", index=False)
-                    return out_path
-
-
-                def flush_current():
-                    nonlocal shard_index, shard_records, current_rows
-                    if current_je_id is None:
-                        return
-                    row = {
-                        "journal_entry_id": current_je.get("journal_entry_id"),
-                        "business_id": current_je.get("business_id"),
-                        "description": current_je.get("je_description", ""),
-                        "currency": current_je.get("currency", ""),
-                        "journal_entry_type": current_je.get("journal_entry_type", ""),
-                    }
-                    row.update(date_features(current_je["date"]))
-                    row["debit_accounts"] = [int(x) for x in debit_accounts]
-                    row["credit_accounts"] = [int(x) for x in credit_accounts]
-                    row["debit_amounts_norm"] = normalize_amounts(debit_amounts)
-                    row["credit_amounts_norm"] = normalize_amounts(credit_amounts)
-                    current_rows.append(row)
-                    all_entries.append(row)
-                    shard_records += 1
-                    if shard_records >= shard_size:
-                        _ = write_shard(current_rows, shard_index)
-                        shard_index += 1
-                        shard_records = 0
-                        current_rows = []
-
-
-                for r in result:
-                    je_id = str(r.journal_entry_id)
-                    if current_je_id is None:
-                        current_je_id = je_id
-                        current_je = {
-                            "journal_entry_id": je_id,
-                            "business_id": r.business_id,
-                            "date": r.date,
-                            "je_description": r.je_description or "",
-                            "currency": r.currency or "",
-                            "journal_entry_type": r.journal_entry_type or "",
-                            "journal_entry_sub_type": r.journal_entry_sub_type or "",
-                        }
-                    if je_id != current_je_id:
-                        flush_current()
-                        current_je_id = je_id
-                        debit_accounts, credit_accounts = [], []
-                        debit_amounts, credit_amounts = [], []
-                        current_je = {
-                            "journal_entry_id": je_id,
-                            "business_id": r.business_id,
-                            "date": r.date,
-                            "je_description": r.je_description or "",
-                            "currency": r.currency or "",
-                            "journal_entry_type": r.journal_entry_type or "",
-                            "journal_entry_sub_type": r.journal_entry_sub_type or "",
-                        }
-                    account_id = None if r.ledger_account_id is None else str(r.ledger_account_id)
-                    if account_id is None:
-                        continue
-                    idx = catalog.id_to_index.get(account_id)
-                    if idx is None:
-                        continue
-                    debit_val = float(r.debit or 0.0)
-                    credit_val = float(r.credit or 0.0)
-                    if debit_val > 0.0:
-                        debit_accounts.append(int(idx))
-                        debit_amounts.append(debit_val)
-                    elif credit_val > 0.0:
-                        credit_accounts.append(int(idx))
-                        credit_amounts.append(credit_val)
-
-
-                flush_current()
-                if current_rows:
-                    _ = write_shard(current_rows, shard_index)
-                parquet_pattern = os.path.join(base_dir, "parquet", "*.parquet")
-                # Write the full set of journal entries as a JSON artifact for training/inspection
-                entries_json_path = os.path.join(base_dir, "artifacts", f"journal_entries_{ts}.json")
-                with open(entries_json_path, "w", encoding="utf-8") as jf:
-                    _json.dump(all_entries, jf, ensure_ascii=False, indent=2)
-                print(f"Ingestion complete. Data saved to: {base_dir}")
 
 
     # Dataset and small subset
