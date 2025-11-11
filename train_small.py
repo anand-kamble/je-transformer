@@ -140,14 +140,23 @@ def main() -> None:
 
     # Generate unique run name/ID EARLY (before any file operations)
     wandb_enabled = not args.no_wandb
+    run_id: Optional[str] = None
     if wandb_enabled:
         # Pre-generate run ID so we can use it for directory naming
-        run_id = wandb.util.generate_id()
+        try:
+            import uuid
+            run_id = uuid.uuid4().hex
+        except Exception:
+            run_id = None
         run_name = args.wandb_name or run_id
     else:
         # If wandb disabled, fallback to timestamp
         import time
         run_name = time.strftime("%Y%m%d-%H%M%S")
+    # Ensure run_name is a non-empty string
+    if not run_name:
+        import time as _time
+        run_name = _time.strftime("%Y%m%d-%H%M%S")
     
     # Update ALL output directories to use run_name
     # 1. Update main output directory
@@ -196,7 +205,9 @@ def main() -> None:
                 job_type="training",
             )
             # Verify run_name matches
-            run_name = wandb.run.name
+            _rn = getattr(wandb, "run", None)
+            if _rn is not None and getattr(_rn, "name", None):
+                run_name = _rn.name  # type: ignore[assignment]
             print(f"Initialized wandb run: {run_name}")
             print(f"All outputs will be saved to: {args.output_dir}")
 
@@ -377,8 +388,8 @@ def main() -> None:
     full_ds = ParquetJEDataset(parquet_pattern, tokenizer_loc=args.encoder, max_length=args.max_length, max_lines=args.max_lines)
     n = len(full_ds)
     lim = max(1, min(int(args.limit), n))
-    idx: List[int] = list(range(lim))
-    ds = Subset(full_ds, idx)
+    subset_indices: List[int] = list(range(lim))
+    ds = Subset(full_ds, subset_indices)
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=collate_fn)
 
 
@@ -678,7 +689,7 @@ def main() -> None:
             print(f"Warning: Failed to update wandb summary: {e}")
     
     print(f"\n{'='*60}")
-    print(f"Training complete!")
+    print("Training complete!")
     print(f"Run name: {run_name}")
     print(f"All outputs saved to: {args.output_dir}")
     print(f"{'='*60}")
