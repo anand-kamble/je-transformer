@@ -385,6 +385,9 @@ def main() -> None:
 
     model.train()
     step = 0
+    best_loss = float("inf")
+    best_epoch = 0
+    best_metrics: Optional[Dict[str, float]] = None
     for epoch in range(args.epochs):
         # Track last metrics from epoch for checkpoint
         last_metrics = None
@@ -493,7 +496,6 @@ def main() -> None:
                     except Exception as e:
                         print(f"Warning: Failed to log to wandb: {e}")
         
-        # Save comprehensive epoch checkpoint
         # Use last metrics from epoch, or default if none available
         if last_metrics is None:
             # Fallback if no metrics were recorded
@@ -507,129 +509,102 @@ def main() -> None:
                 "set_f1": metric_set_f1.result().item() if hasattr(metric_set_f1, 'result') else 0.0,
             }
         current_metrics = last_metrics
-        
-        # Create temporary directory for checkpoint files
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # 1. Save PyTorch checkpoint
-            ckpt_path = os.path.join(tmpdir, f"checkpoint_epoch_{epoch+1}.pt")
-            torch.save({
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": None,  # No scheduler in train_small
-                "epoch": epoch + 1,
-                "step": step,
-                "metrics": current_metrics,
-            }, ckpt_path)
-            
-            # 2. Save model config
-            config_path = os.path.join(tmpdir, "config.json")
-            with open(config_path, "w") as f:
-                json.dump({
-                    "encoder": args.encoder,
-                    "hidden_dim": args.hidden_dim,
-                    "max_lines": args.max_lines,
-                    "max_length": args.max_length,
-                    "temperature": 1.0,  # Model default
-                }, f, indent=2)
-            
-            # 3. Save accounts artifact (copy from source)
-            accounts_path = os.path.join(tmpdir, "accounts_artifact.json")
-            artifact_data = load_json_from_uri(accounts_artifact_path)
-            with open(accounts_path, "w", encoding="utf-8") as f:
-                json.dump(artifact_data, f, indent=2, ensure_ascii=False)
-            
-            # 4. Save training metadata
-            metadata_path = os.path.join(tmpdir, "training_metadata.json")
-            with open(metadata_path, "w") as f:
-                json.dump({
-                    "run_name": run_name,
-                    "epoch": epoch + 1,
-                    "step": step,
-                    "total_steps": len(dl) * (epoch + 1),
-                    "hyperparameters": {
+
+        # Save only if this is the best so far (by lowest loss)
+        current_loss = float(current_metrics.get("loss", float("inf")))
+        if current_loss < best_loss:
+            best_loss = current_loss
+            best_epoch = epoch + 1
+            best_metrics = dict(current_metrics)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # 1. Save model_state.pt (for inference)
+                model_state_path = os.path.join(tmpdir, "model_state.pt")
+                torch.save({"model": model.state_dict()}, model_state_path)
+                # 2. Save model config
+                config_path = os.path.join(tmpdir, "config.json")
+                with open(config_path, "w") as f:
+                    json.dump({
                         "encoder": args.encoder,
                         "hidden_dim": args.hidden_dim,
                         "max_lines": args.max_lines,
                         "max_length": args.max_length,
-                        "batch_size": args.batch_size,
-                        "epochs": args.epochs,
-                        "lr": args.lr,
-                        "flow_weight": args.flow_weight,
-                        "limit": args.limit,
-                        "seed": args.seed,
-                    },
-                    "metrics": current_metrics,
-                }, f, indent=2)
-            
-            # 5. Create wandb artifact
-            if wandb_enabled:
-                try:
-                    artifact = wandb.Artifact(
-                        name=f"model-epoch-{epoch+1}",
-                        type="model",
-                        metadata={
-                            "epoch": epoch + 1,
-                            "step": step,
-                            "set_f1": current_metrics["set_f1"],
-                            "loss": current_metrics["loss"],
-                        }
-                    )
-                    artifact.add_file(ckpt_path, name="checkpoint.pt")
-                    artifact.add_file(config_path, name="config.json")
-                    artifact.add_file(accounts_path, name="accounts_artifact.json")
-                    artifact.add_file(metadata_path, name="training_metadata.json")
-                    wandb.log_artifact(artifact)
-                except Exception as e:
-                    print(f"Warning: Failed to log wandb artifact: {e}")
-            
-            # 6. Also save to local/gs:// (in run_name directory)
-            if args.output_dir.startswith("gs://"):
-                from google.cloud import storage
+                        "temperature": 1.0,
+                    }, f, indent=2)
+                # 3. Save accounts artifact
+                accounts_path = os.path.join(tmpdir, "accounts_artifact.json")
+                artifact_data = load_json_from_uri(accounts_artifact_path)
+                with open(accounts_path, "w", encoding="utf-8") as f:
+                    json.dump(artifact_data, f, indent=2, ensure_ascii=False)
+                # 4. Save training metadata
+                metadata_path = os.path.join(tmpdir, "training_metadata.json")
+                with open(metadata_path, "w") as f:
+                    json.dump({
+                        "run_name": run_name,
+                        "best_epoch": best_epoch,
+                        "step": step,
+                        "total_steps": len(dl) * (epoch + 1),
+                        "hyperparameters": {
+                            "encoder": args.encoder,
+                            "hidden_dim": args.hidden_dim,
+                            "max_lines": args.max_lines,
+                            "max_length": args.max_length,
+                            "batch_size": args.batch_size,
+                            "epochs": args.epochs,
+                            "lr": args.lr,
+                            "flow_weight": args.flow_weight,
+                            "limit": args.limit,
+                            "seed": args.seed,
+                        },
+                        "metrics": best_metrics,
+                    }, f, indent=2)
 
+                # Log wandb artifact for best only
+                if wandb_enabled:
+                    try:
+                        artifact = wandb.Artifact(
+                            name="model-best",
+                            type="model",
+                            metadata={
+                                "epoch": best_epoch,
+                                "step": step,
+                                "set_f1": best_metrics.get("set_f1", 0.0),
+                                "loss": best_metrics.get("loss", 0.0),
+                            }
+                        )
+                        artifact.add_file(model_state_path, name="model_state.pt")
+                        artifact.add_file(config_path, name="config.json")
+                        artifact.add_file(accounts_path, name="accounts_artifact.json")
+                        artifact.add_file(metadata_path, name="training_metadata.json")
+                        wandb.log_artifact(artifact)
+                    except Exception as e:
+                        print(f"Warning: Failed to log wandb artifact: {e}")
 
-                client = storage.Client()
-                _, path = args.output_dir.split("gs://", 1)
-                bucket_name, prefix = path.split("/", 1)
-                
-                # Upload all checkpoint files
-                for fname, fpath in [
-                    (f"checkpoint_epoch_{epoch+1}.pt", ckpt_path),
-                    ("config.json", config_path),
-                    ("accounts_artifact.json", accounts_path),
-                    ("training_metadata.json", metadata_path),
-                ]:
-                    blob = client.bucket(bucket_name).blob(f"{prefix.rstrip('/')}/{fname}")
-                    blob.upload_from_filename(fpath)
-                print(f"Epoch {epoch+1} checkpoint uploaded to {args.output_dir}")
-            else:
-                # Copy all checkpoint files to local directory
-                for fname, fpath in [
-                    (f"checkpoint_epoch_{epoch+1}.pt", ckpt_path),
-                    ("config.json", config_path),
-                    ("accounts_artifact.json", accounts_path),
-                    ("training_metadata.json", metadata_path),
-                ]:
-                    shutil.copy2(fpath, os.path.join(args.output_dir, fname))
-                print(f"Epoch {epoch+1} checkpoint saved to {args.output_dir}")
+                # Save best files to output dir (local or GCS)
+                if args.output_dir.startswith("gs://"):
+                    from google.cloud import storage
+                    client = storage.Client()
+                    _, path = args.output_dir.split("gs://", 1)
+                    bucket_name, prefix = path.split("/", 1)
+                    for fname, fpath in [
+                        ("model_state.pt", model_state_path),
+                        ("config.json", config_path),
+                        ("accounts_artifact.json", accounts_path),
+                        ("training_metadata.json", metadata_path),
+                    ]:
+                        blob = client.bucket(bucket_name).blob(f"{prefix.rstrip('/')}/{fname}")
+                        blob.upload_from_filename(fpath)
+                    print(f"New best (epoch {best_epoch}, loss={best_loss:.4f}) uploaded to {args.output_dir}")
+                else:
+                    for fname, fpath in [
+                        ("model_state.pt", model_state_path),
+                        ("config.json", config_path),
+                        ("accounts_artifact.json", accounts_path),
+                        ("training_metadata.json", metadata_path),
+                    ]:
+                        shutil.copy2(fpath, os.path.join(args.output_dir, fname))
+                    print(f"New best (epoch {best_epoch}, loss={best_loss:.4f}) saved to {args.output_dir}")
 
-
-    # Save final checkpoint
-    if args.output_dir.startswith("gs://"):
-        tmp = "/tmp/model_state.pt"
-        torch.save({"model": model.state_dict()}, tmp)
-        from google.cloud import storage
-
-
-        client = storage.Client()
-        _, path = args.output_dir.split("gs://", 1)
-        bucket_name, prefix = path.split("/", 1)
-        blob = client.bucket(bucket_name).blob(f"{prefix.rstrip('/')}/model_state.pt")
-        blob.upload_from_filename(tmp)
-        print(f"Final checkpoint uploaded to {args.output_dir}")
-    else:
-        ckpt = os.path.join(args.output_dir, "model_state.pt")
-        torch.save({"model": model.state_dict()}, ckpt)
-        print(f"Final checkpoint written to {ckpt}")
+    # Only the best checkpoint is saved during training; nothing else to do here.
     
     # Log final summary to wandb
     if wandb_enabled:
@@ -639,6 +614,9 @@ def main() -> None:
                 "final_step": step,
                 "final_set_f1": metric_set_f1.result().item(),
                 "output_directory": args.output_dir,
+                "best_epoch": best_epoch,
+                "best_loss": best_loss,
+                "best_set_f1": (best_metrics.get("set_f1") if isinstance(best_metrics, dict) else None) if best_metrics is not None else None,
             })
             wandb.finish()
         except Exception as e:
