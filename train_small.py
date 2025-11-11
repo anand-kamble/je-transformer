@@ -123,9 +123,7 @@ def main() -> None:
     parser.add_argument("--flow-warmup-epochs", type=int, default=3, help="Epochs to apply warmup multiplier to flow loss")
     parser.add_argument("--flow-warmup-multiplier", type=float, default=5.0, help="Multiplier for flow loss during warmup")
     # Optional retrieval memory integration
-    parser.add_argument("--retrieval-index-dir", type=str, default=os.environ.get("RETRIEVAL_INDEX_DIR"), help="ScaNN index dir (gs:// or local). If provided with ids and embeddings, retrieval is enabled.")
-    parser.add_argument("--retrieval-ids-uri", type=str, default=os.environ.get("RETRIEVAL_IDS_URI"), help="Text file with ids (gs:// or local)")
-    parser.add_argument("--retrieval-embeddings-uri", type=str, default=os.environ.get("RETRIEVAL_EMBEDDINGS_URI"), help="NumPy .npy of neighbor embeddings aligned to ids (gs:// or local)")
+    parser.add_argument("--retrieval-index-dir", type=str, default=os.environ.get("RETRIEVAL_INDEX_DIR"), help="ScaNN index dir (gs://). Enables retrieval when provided")
     parser.add_argument("--retrieval-top-k", type=int, default=int(os.environ.get("RETRIEVAL_TOP_K", "5")))
     parser.add_argument("--retrieval-use-cls", action="store_true", help="Use [CLS] for pooling the query (defaults to mean pooling)")
     parser.add_argument("--limit", type=int, default=20000, help="Train on first N examples only")
@@ -280,28 +278,45 @@ def main() -> None:
                     return blob.download_as_bytes()
                 with open(path, "rb") as f:
                     return f.read()
-            def _download_prefix_to_local(src: str) -> str:
+            def _download_scann_dir(src: str) -> str:
                 import tempfile as _tf
                 import os as _os
                 if not src.startswith("gs://"):
-                    return src
+                    raise RuntimeError("Retrieval is GCS-only; --retrieval-index-dir must be a gs:// URI")
                 tmpdir = _tf.mkdtemp(prefix="scann_idx_")
                 from google.cloud import storage  # type: ignore
                 client = storage.Client()
                 _, path = src.split("gs://", 1)
                 bucket_name, prefix = path.split("/", 1)
                 bucket = client.bucket(bucket_name)
-                for blob in bucket.list_blobs(prefix=prefix.rstrip("/")):
-                    if blob.name.endswith("/"):
-                        continue
-                    rel_base = prefix.rstrip("/") + "/"
-                    rel = blob.name[len(rel_base):] if blob.name.startswith(rel_base) else os.path.basename(blob.name)
-                    dst = _os.path.join(tmpdir, rel)
-                    _os.makedirs(_os.path.dirname(dst), exist_ok=True)
-                    blob.download_to_filename(dst)
+                # Explicitly ensure required ScaNN files exist at the directory root
+                required_files = [
+                    "serialized_partitioner.pb",
+                    "scann_config.pb",
+                    "scann_assets.pbtxt",
+                    "ah_codebook.pb",  # required when score_ah() was used to build
+                ]
+                optional_files = ["dataset.npy", "hashed_dataset.npy", "datapoint_to_token.npy"]
+                for fname in required_files:
+                    blob = bucket.blob(f"{prefix.rstrip('/')}/{fname}")
+                    if not blob.exists(client):
+                        raise RuntimeError(
+                            f"Missing required ScaNN file '{fname}' at {src}. "
+                            "Ensure the index directory contains the serialized ScaNN files at its root."
+                        )
+                    local_path = _os.path.join(tmpdir, fname)
+                    blob.download_to_filename(local_path)
+                    if _os.path.getsize(local_path) == 0:
+                        raise RuntimeError(f"Downloaded zero-byte ScaNN file '{fname}' from {src}")
+                # Best-effort download of optional artifacts
+                for fname in optional_files:
+                    blob = bucket.blob(f"{prefix.rstrip('/')}/{fname}")
+                    if blob.exists(client):
+                        local_path = _os.path.join(tmpdir, fname)
+                        blob.download_to_filename(local_path)
                 return tmpdir
             # Load searcher and embeddings
-            _idx_dir_local = _download_prefix_to_local(args.retrieval_index_dir)
+            _idx_dir_local = _download_scann_dir(args.retrieval_index_dir)
             # Load ScaNN searcher directly from the directory
             _retr_searcher = scann.scann_ops_pybind.load_searcher(_idx_dir_local)
             # Try to read manifest for settings and file hints
@@ -311,25 +326,21 @@ def main() -> None:
                 with open(manifest_path, "r", encoding="utf-8") as mf:
                     manifest = json.load(mf)
                 _normalize_queries = bool(manifest.get("l2_normalized", True))
-            # Locate embeddings: prefer CLI override, else manifest, else common defaults
+            # Locate embeddings under the index dir (manifest → embeddings.npy → dataset.npy)
             emb_np = None
-            if args.retrieval_embeddings_uri:
-                emb_bytes = _load_bytes(args.retrieval_embeddings_uri)
-                emb_np = _np.load(__import__("io").BytesIO(emb_bytes))  # [N, H_enc]
-            else:
-                candidates: List[str] = []
-                if manifest and isinstance(manifest.get("files", {}), dict):
-                    emb_rel = manifest["files"].get("embeddings")
-                    if emb_rel:
-                        candidates.append(os.path.join(_idx_dir_local, emb_rel))
-                candidates.extend([
-                    os.path.join(_idx_dir_local, "embeddings.npy"),
-                    os.path.join(_idx_dir_local, "dataset.npy"),
-                ])
-                for p in candidates:
-                    if os.path.exists(p):
-                        emb_np = _np.load(p)
-                        break
+            candidates: List[str] = []
+            if manifest and isinstance(manifest.get("files", {}), dict):
+                emb_rel = manifest["files"].get("embeddings")
+                if emb_rel:
+                    candidates.append(os.path.join(_idx_dir_local, emb_rel))
+            candidates.extend([
+                os.path.join(_idx_dir_local, "embeddings.npy"),
+                os.path.join(_idx_dir_local, "dataset.npy"),
+            ])
+            for p in candidates:
+                if os.path.exists(p):
+                    emb_np = _np.load(p)
+                    break
             if emb_np is None:
                 raise RuntimeError("Could not locate retrieval embeddings (tried manifest → embeddings.npy → dataset.npy).")
             # Project to hidden_dim using the model's enc_proj and tanh, on CPU and no grad

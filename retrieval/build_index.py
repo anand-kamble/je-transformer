@@ -2,18 +2,20 @@
 """
 Build an ANN retrieval index (ScaNN) over description embeddings (PyTorch).
 
-Pipeline:
-  - Read Parquet shards produced by data/ingest_to_parquet.py
+GCS-only flow:
+  - Read Parquet shards from a gs:// glob (produced by data/ingest_to_parquet.py)
   - Extract description and journal_entry_id
   - Normalize + tokenize, encode to embeddings with a pretrained encoder (PyTorch)
-  - L2-normalize embeddings (optional, default true)
-  - Train and build ScaNN index
-  - Upload index artifacts and ids list to GCS
+  - L2-normalize embeddings (optional)
+  - Build ScaNN index
+  - Write the following under --output-index-dir (gs://.../index):
+      - serialized_partitioner.pb, scann_config.pb, scann_assets.pbtxt, ah_codebook.pb
+      - embeddings.npy (float32), ids.txt (aligned to embeddings)
+      - index_manifest.json (metadata for loader)
 """
 from __future__ import annotations
 
 import argparse
-import io
 import os
 import sys
 import tempfile
@@ -26,7 +28,6 @@ import pyarrow.parquet as pq
 import scann
 import torch
 import json
-import shutil
 from google.cloud import storage
 from transformers import AutoModel, AutoTokenizer
 
@@ -38,7 +39,6 @@ if PROJECT_ROOT not in sys.path:
 try:
     from data.text_normalization import normalize_description
 except Exception:
-    # Fallback: simple normalization if project import fails
     def normalize_description(text: str) -> str:
         return (text or "").strip().lower()
 
@@ -50,50 +50,37 @@ def mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> 
     return summed / denom
 
 
-def _export_dir(local_dir: str, target_dir: str) -> None:
-    """
-    Export a directory tree either to a local path (copy) or to GCS (upload),
-    preserving the relative directory structure.
-    """
-    if target_dir.startswith("gs://"):
-        client = storage.Client()
-        _, path = target_dir.split("gs://", 1)
-        bucket_name, prefix = path.split("/", 1)
-        bucket = client.bucket(bucket_name)
-        for root, _, files in os.walk(local_dir):
-            for f in files:
-                lp = os.path.join(root, f)
-                rel = os.path.relpath(lp, start=local_dir).replace(os.sep, "/")
-                blob = bucket.blob(f"{prefix.rstrip('/')}/{rel}")
-                blob.upload_from_filename(lp)
-    else:
-        os.makedirs(target_dir, exist_ok=True)
-        for root, _, files in os.walk(local_dir):
-            for f in files:
-                src = os.path.join(root, f)
-                rel = os.path.relpath(src, start=local_dir)
-                dst = os.path.join(target_dir, rel)
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.copy2(src, dst)
-
-
-def write_ids_to_gcs(ids: List[str], gcs_uri: str) -> None:
-    if not gcs_uri.startswith("gs://"):
-        raise ValueError("gcs_uri must start with gs://")
+def _upload_dir_to_gcs(local_dir: str, gcs_dir: str) -> None:
+    if not gcs_dir.startswith("gs://"):
+        raise ValueError("output-index-dir must be a gs:// URI")
     client = storage.Client()
-    _, path = gcs_uri.split("gs://", 1)
-    bucket_name, blob_name = path.split("/", 1)
+    _, path = gcs_dir.split("gs://", 1)
+    bucket_name, prefix = path.split("/", 1)
     bucket = client.bucket(bucket_name)
-    blob = bucket.blob(blob_name)
-    blob.upload_from_string("\n".join(ids), content_type="text/plain")
+    for root, _, files in os.walk(local_dir):
+        for f in files:
+            lp = os.path.join(root, f)
+            blob = bucket.blob(f"{prefix.rstrip('/')}/{os.path.basename(lp)}")
+            blob.upload_from_filename(lp)
+
+
+def _expand_gcs_glob(pattern: str) -> List[str]:
+    if not (pattern.startswith("gs://") and ("*" in pattern or "?" in pattern)):
+        raise ValueError("--parquet-pattern must be a gs:// glob")
+    _, path = pattern.split("gs://", 1)
+    bucket_name, key_pattern = path.split("/", 1)
+    prefix = key_pattern.rsplit("/", 1)[0]
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blobs = list(bucket.list_blobs(prefix=prefix.rstrip("/")))
+    candidates = [f"gs://{bucket_name}/{b.name}" for b in blobs if b.name.endswith(".parquet")]
+    return sorted([p for p in candidates if fnmatch.fnmatch(p, pattern)])
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build ScaNN index over description embeddings (Parquet → PyTorch)")
-    parser.add_argument("--parquet-pattern", type=str, required=True, help="Parquet glob, e.g., gs://bucket/prefix/parquet/*.parquet")
-    parser.add_argument("--output-index-dir", type=str, required=True, help="GCS dir for ScaNN index artifacts")
-    parser.add_argument("--output-ids-uri", type=str, required=True, help="GCS URI for ids list (one journal_entry_id per line)")
-    parser.add_argument("--output-embeddings-uri", type=str, default=None, help="Optional GCS URI to store raw embedding matrix (.npy)")
+    parser = argparse.ArgumentParser(description="Build ScaNN index over description embeddings (GCS-only)")
+    parser.add_argument("--parquet-pattern", type=str, required=True, help="gs://.../parquet/*.parquet (GCS glob)")
+    parser.add_argument("--output-index-dir", type=str, required=True, help="gs://.../index (GCS directory for index + artifacts)")
     parser.add_argument("--encoder-loc", type=str, default="bert-base-multilingual-cased")
     parser.add_argument("--max-length", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -104,24 +91,11 @@ def main():
     parser.add_argument("--scann-reorder", type=int, default=250)
     args = parser.parse_args()
 
-    import glob
-    pattern = args.parquet_pattern
-    if pattern.startswith("gs://") and ("*" in pattern or "?" in pattern):
-        # Expand GCS wildcard manually
-        try:
-            from google.cloud import storage  # type: ignore
-            _, path = pattern.split("gs://", 1)
-            bucket_name, key_pattern = path.split("/", 1)
-            prefix = key_pattern.rsplit("/", 1)[0]
-            client = storage.Client()
-            bucket = client.bucket(bucket_name)
-            blobs = list(bucket.list_blobs(prefix=prefix.rstrip("/")))
-            candidates = [f"gs://{bucket_name}/{b.name}" for b in blobs if b.name.endswith(".parquet")]
-            paths = sorted([p for p in candidates if fnmatch.fnmatch(p, pattern)])
-        except Exception:
-            paths = []
-    else:
-        paths = sorted(glob.glob(pattern))
+    # GCS-only parquet expansion
+    try:
+        paths = _expand_gcs_glob(args.parquet_pattern)
+    except Exception:
+        paths = []
     if not paths:
         raise ValueError(f"No Parquet files matched pattern: {args.parquet_pattern}")
 
@@ -196,24 +170,8 @@ def main():
         }
         with open(os.path.join(tmpdir, "index_manifest.json"), "w", encoding="utf-8") as mf:
             json.dump(manifest, mf, indent=2)
-        # Export entire directory to the target (local or GCS), preserving structure
-        _export_dir(tmpdir, args.output_index_dir)
-
-    # Back-compat: also ship separate ids and embeddings to user-provided URIs if specified
-    write_ids_to_gcs(all_ids, args.output_ids_uri)
-    if args.output_embeddings_uri:
-        if not args.output_embeddings_uri.startswith("gs://"):
-            raise ValueError("--output-embeddings-uri must start with gs://")
-        from google.cloud import storage as gcs_storage  # avoid linter false-positive on unbound name
-        client = gcs_storage.Client()
-        _, path = args.output_embeddings_uri.split("gs://", 1)
-        bucket_name, blob_name = path.split("/", 1)
-        bucket = client.bucket(bucket_name)
-        blob = bucket.blob(blob_name)
-        buf = io.BytesIO()
-        np.save(buf, embs)
-        buf.seek(0)
-        blob.upload_from_file(buf, content_type="application/octet-stream")
+        # Upload to GCS (root of index dir)
+        _upload_dir_to_gcs(tmpdir, args.output_index_dir)
 
 
 if __name__ == "__main__":

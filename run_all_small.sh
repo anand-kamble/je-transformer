@@ -31,8 +31,6 @@ RUN_NAME="${RUN_NAME:-$(date +%Y%m%d-%H%M%S)}"
 # Derived retrieval artifact locations (per-run to avoid clobbering)
 RETR_PREFIX_RUN="${RETRIEVAL_PREFIX%/}/${RUN_NAME}"
 RETR_INDEX_DIR="${RETR_PREFIX_RUN}/index"
-RETR_IDS_URI="${RETR_PREFIX_RUN}/ids.txt"
-RETR_EMB_URI="${RETR_PREFIX_RUN}/embeddings.npy"
 
 echo "================================================================"
 echo "Run name: ${RUN_NAME}"
@@ -84,8 +82,6 @@ INGEST_OUT="${INGEST_OUT}"
 PARQUET_PATTERN="${PARQUET_PATTERN}"
 ACCOUNTS_URI="${ACCOUNTS_URI}"
 RETR_INDEX_DIR="${RETR_INDEX_DIR}"
-RETR_IDS_URI="${RETR_IDS_URI}"
-RETR_EMB_URI="${RETR_EMB_URI}"
 OUTPUTS_DIR="${OUTPUTS_DIR}"
 EOF
 echo "[1/3] Saved run variables to ${RUN_VARS_FILE}"
@@ -95,8 +91,6 @@ echo "[2/3] Building retrieval index into ${RETR_INDEX_DIR} ..."
 "${PYTHON_BIN}" "${ROOT}/retrieval/build_index.py" \
   --parquet-pattern "${PARQUET_PATTERN}" \
   --output-index-dir "${RETR_INDEX_DIR}" \
-  --output-ids-uri "${RETR_IDS_URI}" \
-  --output-embeddings-uri "${RETR_EMB_URI}" \
   --encoder-loc "${ENCODER}" \
   --max-length 128 \
   --batch-size 512 \
@@ -135,8 +129,6 @@ echo "Pipeline complete."
 echo "Run name: ${RUN_NAME}"
 echo "Parquet pattern: ${PARQUET_PATTERN}"
 echo "Retrieval index: ${RETR_INDEX_DIR}"
-echo "Retrieval ids:   ${RETR_IDS_URI}"
-echo "Retrieval embs:  ${RETR_EMB_URI}"
 echo "Outputs dir:     ${OUTPUTS_DIR}"
 echo "================================================================"
 
