@@ -17,6 +17,7 @@ import io
 import os
 import sys
 import tempfile
+import fnmatch
 from typing import Dict, List
 
 import numpy as np
@@ -90,7 +91,23 @@ def main():
     args = parser.parse_args()
 
     import glob
-    paths = sorted(glob.glob(args.parquet_pattern))
+    pattern = args.parquet_pattern
+    if pattern.startswith("gs://") and ("*" in pattern or "?" in pattern):
+        # Expand GCS wildcard manually
+        try:
+            from google.cloud import storage  # type: ignore
+            _, path = pattern.split("gs://", 1)
+            bucket_name, key_pattern = path.split("/", 1)
+            prefix = key_pattern.rsplit("/", 1)[0]
+            client = storage.Client()
+            bucket = client.bucket(bucket_name)
+            blobs = list(bucket.list_blobs(prefix=prefix.rstrip("/")))
+            candidates = [f"gs://{bucket_name}/{b.name}" for b in blobs if b.name.endswith(".parquet")]
+            paths = sorted([p for p in candidates if fnmatch.fnmatch(p, pattern)])
+        except Exception:
+            paths = []
+    else:
+        paths = sorted(glob.glob(pattern))
     if not paths:
         raise ValueError(f"No Parquet files matched pattern: {args.parquet_pattern}")
 
