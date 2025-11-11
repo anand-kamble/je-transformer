@@ -23,7 +23,7 @@ from data.ingest_to_parquet import (AccountCatalog, build_join_statement,
                                     reflect_or_define_tables, write_gcs_json,
                                     write_parquet_shards)
 from models.catalog_encoder import CatalogEncoder
-from models.je_model_torch import JEModel
+from models.je_model_torch import JEModel, mean_pool
 from models.losses import (SetF1Metric, coverage_penalty, flow_aux_loss,
                            pointer_loss, side_loss, stop_loss)
 from train.dataset import ParquetJEDataset, collate_fn
@@ -126,6 +126,12 @@ def main() -> None:
     # Flow warmup
     parser.add_argument("--flow-warmup-epochs", type=int, default=3, help="Epochs to apply warmup multiplier to flow loss")
     parser.add_argument("--flow-warmup-multiplier", type=float, default=5.0, help="Multiplier for flow loss during warmup")
+    # Optional retrieval memory integration
+    parser.add_argument("--retrieval-index-dir", type=str, default=os.environ.get("RETRIEVAL_INDEX_DIR"), help="ScaNN index dir (gs:// or local). If provided with ids and embeddings, retrieval is enabled.")
+    parser.add_argument("--retrieval-ids-uri", type=str, default=os.environ.get("RETRIEVAL_IDS_URI"), help="Text file with ids (gs:// or local)")
+    parser.add_argument("--retrieval-embeddings-uri", type=str, default=os.environ.get("RETRIEVAL_EMBEDDINGS_URI"), help="NumPy .npy of neighbor embeddings aligned to ids (gs:// or local)")
+    parser.add_argument("--retrieval-top-k", type=int, default=int(os.environ.get("RETRIEVAL_TOP_K", "5")))
+    parser.add_argument("--retrieval-use-cls", action="store_true", help="Use [CLS] for pooling the query (defaults to mean pooling)")
     parser.add_argument("--limit", type=int, default=20000, help="Train on first N examples only")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--wandb-project", type=str, default="je-transformer", help="W&B project name")
@@ -199,6 +205,11 @@ def main() -> None:
                     "trainable_catalog": args.trainable_catalog,
                     "flow_warmup_epochs": args.flow_warmup_epochs,
                     "flow_warmup_multiplier": args.flow_warmup_multiplier,
+                    "retrieval_index_dir": args.retrieval_index_dir,
+                    "retrieval_ids_uri": args.retrieval_ids_uri,
+                    "retrieval_embeddings_uri": args.retrieval_embeddings_uri,
+                    "retrieval_top_k": args.retrieval_top_k,
+                    "retrieval_use_cls": args.retrieval_use_cls,
                     "limit": args.limit,
                     "seed": args.seed,
                 },
@@ -407,6 +418,78 @@ def main() -> None:
         use_pointer_norm=not args.no_pointer_norm,
         learn_catalog=bool(args.trainable_catalog),
     ).to(device)
+    # Optional: load retrieval artifacts once and pre-project embeddings to model hidden dim
+    retrieval_enabled = bool(args.retrieval_index_dir and args.retrieval_ids_uri and args.retrieval_embeddings_uri)
+    _retr_searcher = None
+    _retr_proj_embs = None  # torch.Tensor on CPU [N, H_hidden]
+    if retrieval_enabled:
+        try:
+            import scann  # type: ignore
+            import numpy as _np
+            # Helper loaders supporting gs:// and local
+            def _load_bytes(path: str) -> bytes:
+                if path.startswith("gs://"):
+                    from google.cloud import storage  # type: ignore
+                    client = storage.Client()
+                    _, p = path.split("gs://", 1)
+                    bkt, blob_name = p.split("/", 1)
+                    blob = client.bucket(bkt).blob(blob_name)
+                    return blob.download_as_bytes()
+                with open(path, "rb") as f:
+                    return f.read()
+            def _download_scann_dir(src: str) -> str:
+                import tempfile as _tf, os as _os
+                if not src.startswith("gs://"):
+                    return src
+                tmpdir = _tf.mkdtemp(prefix="scann_idx_")
+                from google.cloud import storage  # type: ignore
+                client = storage.Client()
+                _, path = src.split("gs://", 1)
+                bucket_name, prefix = path.split("/", 1)
+                bucket = client.bucket(bucket_name)
+                for blob in bucket.list_blobs(prefix=prefix.rstrip("/")):
+                    if blob.name.endswith("/"):
+                        continue
+                    lp = _os.path.join(tmpdir, _os.path.relpath(blob.name, start=prefix.rstrip("/")))
+                    _os.makedirs(_os.path.dirname(lp), exist_ok=True)
+                    blob.download_to_filename(lp)
+                return tmpdir
+            # Load searcher and embeddings
+            _idx_dir_local = _download_scann_dir(args.retrieval_index_dir)
+            _retr_searcher = scann.scann_ops_pybind.load_searcher(_idx_dir_local)
+            # Load embeddings and ids
+            ids_bytes = _load_bytes(args.retrieval_ids_uri)
+            ids_text = ids_bytes.decode("utf-8")
+            _ = [line for line in ids_text.splitlines() if line.strip()]  # kept for alignment checks if needed later
+            emb_bytes = _load_bytes(args.retrieval_embeddings_uri)
+            emb_np = _np.load(__import__("io").BytesIO(emb_bytes))  # [N, H_enc]
+            # Project to hidden_dim using the model's enc_proj and tanh, on CPU and no grad
+            with torch.no_grad():
+                emb_t = torch.tensor(emb_np, dtype=torch.float32)  # CPU
+                proj = torch.tanh(model.enc_proj(emb_t.to(device=model.enc_proj.weight.device)))  # [N, H_hidden] on model device
+                _retr_proj_embs = proj.detach().cpu()  # keep on CPU, move to device per batch
+            print(f"Loaded retrieval artifacts. Embeddings: {_retr_proj_embs.shape}, top_k={int(args.retrieval_top_k)}")
+        except Exception as e:
+            print(f"Warning: retrieval disabled due to load error: {e}")
+            retrieval_enabled = False
+    # Small helper to build retrieval memory per batch
+    def _build_retrieval_memory_batch(_inp_ids: torch.Tensor, _attn: torch.Tensor) -> Optional[torch.Tensor]:
+        if not retrieval_enabled:
+            return None
+        assert _retr_searcher is not None and _retr_proj_embs is not None
+        with torch.no_grad():
+            enc_out = model.encoder(input_ids=_inp_ids, attention_mask=_attn)
+            pooled = enc_out.last_hidden_state[:, 0, :] if args.retrieval_use_cls else mean_pool(enc_out.last_hidden_state, _attn)
+            q_cpu = pooled.detach().cpu()
+            q_cpu = q_cpu / (q_cpu.norm(dim=1, keepdim=True) + 1e-8)
+            nbrs, _ = _retr_searcher.search_batched(q_cpu.numpy(), final_num_neighbors=int(args.retrieval_top_k))
+            mem_list = []
+            for i in range(len(nbrs)):
+                idx_tensor = torch.tensor(nbrs[i], dtype=torch.long)
+                mem_i = _retr_proj_embs.index_select(0, idx_tensor)  # [K, H]
+                mem_list.append(mem_i)
+            mem = torch.stack(mem_list, dim=0).to(device)  # [B, K, H]
+        return mem
     if args.trainable_catalog:
         try:
             model.set_catalog_embeddings(cat_emb)
@@ -454,13 +537,15 @@ def main() -> None:
 
 
             optimizer.zero_grad(set_to_none=True)
+            # Optional retrieval memory
+            retr_mem = _build_retrieval_memory_batch(input_ids, attention_mask) if retrieval_enabled else None
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 prev_account_idx=prev_account_idx,
                 prev_side_id=prev_side_id,
                 catalog_embeddings=cat_emb,
-                retrieval_memory=None,
+                retrieval_memory=retr_mem,
                 cond_numeric=cond_numeric,
                 currency=currency,
                 journal_entry_type=journal_entry_type,
@@ -588,6 +673,11 @@ def main() -> None:
                         "learnable_pointer_scale": bool(args.learnable_pointer_scale),
                         "pointer_use_norm": not args.no_pointer_norm,
                         "trainable_catalog": bool(args.trainable_catalog),
+                        "retrieval_index_dir": args.retrieval_index_dir,
+                        "retrieval_ids_uri": args.retrieval_ids_uri,
+                        "retrieval_embeddings_uri": args.retrieval_embeddings_uri,
+                        "retrieval_top_k": int(args.retrieval_top_k),
+                        "retrieval_use_cls": bool(args.retrieval_use_cls),
                     }, f, indent=2)
                 # 3. Save accounts artifact
                 accounts_path = os.path.join(tmpdir, "accounts_artifact.json")
@@ -618,6 +708,11 @@ def main() -> None:
                             "trainable_catalog": args.trainable_catalog,
                             "flow_warmup_epochs": args.flow_warmup_epochs,
                             "flow_warmup_multiplier": args.flow_warmup_multiplier,
+                            "retrieval_index_dir": args.retrieval_index_dir,
+                            "retrieval_ids_uri": args.retrieval_ids_uri,
+                            "retrieval_embeddings_uri": args.retrieval_embeddings_uri,
+                            "retrieval_top_k": args.retrieval_top_k,
+                            "retrieval_use_cls": args.retrieval_use_cls,
                             "limit": args.limit,
                             "seed": args.seed,
                         },
