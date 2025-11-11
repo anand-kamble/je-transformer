@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Root of this repo (absolute path preferred)
-ROOT="/home/iunme/je-transformer"
+ROOT="."
 PYTHON_BIN="${PYTHON:-python}"
 
 # High-level configuration (override via env when calling this script)
