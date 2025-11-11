@@ -111,8 +111,8 @@ def main():
     if not paths:
         raise ValueError(f"No Parquet files matched pattern: {args.parquet_pattern}")
 
-    # Load Parquet shards
-    frames = [pq.read_table(p).to_pandas(columns=["journal_entry_id", "description"]) for p in paths]
+    # Load Parquet shards (select only the needed columns)
+    frames = [pq.read_table(p, columns=["journal_entry_id", "description"]).to_pandas() for p in paths]
     df = pd.concat(frames, ignore_index=True)
 
     tokenizer = AutoTokenizer.from_pretrained(args.encoder_loc, use_fast=False)
