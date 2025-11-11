@@ -25,13 +25,14 @@ GCS_INGEST_PREFIX="${GCS_INGEST_PREFIX:-gs://dev-rai-files/je-ingest}"
 RETRIEVAL_PREFIX="${RETRIEVAL_PREFIX:-gs://dev-rai-files/retrieval}"
 OUTPUTS_DIR="${OUTPUTS_DIR:-gs://dev-rai-files/outputs}"
 
-# Derived retrieval artifact locations
-RETR_INDEX_DIR="${RETRIEVAL_PREFIX}/index"
-RETR_IDS_URI="${RETRIEVAL_PREFIX}/ids.txt"
-RETR_EMB_URI="${RETRIEVAL_PREFIX}/embeddings.npy"
-
 # Generate a run name or honor an externally supplied RUN_NAME
 RUN_NAME="${RUN_NAME:-$(date +%Y%m%d-%H%M%S)}"
+
+# Derived retrieval artifact locations (per-run to avoid clobbering)
+RETR_PREFIX_RUN="${RETRIEVAL_PREFIX%/}/${RUN_NAME}"
+RETR_INDEX_DIR="${RETR_PREFIX_RUN}/index"
+RETR_IDS_URI="${RETR_PREFIX_RUN}/ids.txt"
+RETR_EMB_URI="${RETR_PREFIX_RUN}/embeddings.npy"
 
 echo "================================================================"
 echo "Run name: ${RUN_NAME}"
@@ -107,6 +108,7 @@ echo "[2/3] Retrieval artifacts written."
 echo "[3/3] Training model with retrieval ..."
 "${PYTHON_BIN}" "${ROOT}/train_small.py" \
   --encoder "${ENCODER}" \
+  --max-length 128 \
   --hidden-dim "${HIDDEN_DIM}" \
   --max-lines "${MAX_LINES}" \
   --batch-size "${BATCH_SIZE}" \
@@ -125,8 +127,6 @@ echo "[3/3] Training model with retrieval ..."
   --flow-warmup-epochs "${FLOW_WARMUP_EPOCHS}" \
   --flow-warmup-multiplier "${FLOW_WARMUP_MULT}" \
   --retrieval-index-dir "${RETR_INDEX_DIR}" \
-  --retrieval-ids-uri "${RETR_IDS_URI}" \
-  --retrieval-embeddings-uri "${RETR_EMB_URI}" \
   --retrieval-top-k "${TOP_K}" \
   --retrieval-use-cls
 
