@@ -25,10 +25,15 @@ class JEModel(nn.Module):
         hidden_dim: int = 256,
         max_lines: int = 8,
         temperature: float = 1.0,
+        pointer_scale_init: float = 1.0,
+        pointer_learnable_scale: bool = False,
+        use_pointer_norm: bool = True,
+        learn_catalog: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.max_lines = int(max_lines)
+        self._learn_catalog = bool(learn_catalog)
 
         # Text encoder
         self.encoder = AutoModel.from_pretrained(encoder_loc)
@@ -54,12 +59,23 @@ class JEModel(nn.Module):
         self.post_retr_proj = nn.Linear(2 * hidden_dim, hidden_dim)
 
         # Heads
-        self.pointer = PointerLayer(temperature=temperature)
+        self.pointer = PointerLayer(
+            temperature=temperature,
+            learnable_scale=pointer_learnable_scale,
+            scale_init=pointer_scale_init,
+            use_norm=use_pointer_norm,
+        )
         self.side_head = nn.Linear(hidden_dim, 2)
         self.stop_head = nn.Linear(hidden_dim, 2)
 
         # Embedding for previous side id (0/1), BOS handled by zeros externally
         self.prev_side_emb = nn.Embedding(2, hidden_dim)
+
+    def set_catalog_embeddings(self, catalog_embeddings: torch.Tensor) -> None:
+        """
+        Optionally register catalog embeddings as a trainable parameter.
+        """
+        self.catalog_param = nn.Parameter(catalog_embeddings.detach().clone().to(dtype=torch.float32))
 
     def _hash_strs(self, xs: List[str], buckets: int) -> torch.Tensor:
         ids = [md5_to_bucket(x or "", buckets) for x in xs]
@@ -124,7 +140,8 @@ class JEModel(nn.Module):
 
         # Retrieval fusion
         if retrieval_memory is None:
-            H = catalog_embeddings.shape[-1] if catalog_embeddings.dim() == 2 else catalog_embeddings.shape[-1]
+            cat_src = self.catalog_param if (self._learn_catalog and hasattr(self, "catalog_param")) else catalog_embeddings
+            H = cat_src.shape[-1] if cat_src.dim() == 2 else cat_src.shape[-1]
             retrieval_memory = torch.zeros((1, H), dtype=dec_h.dtype, device=dec_h.device)
         retr_mem_proj = self.retr_mem_proj(retrieval_memory)
         if retr_mem_proj.dim() == 2:
@@ -140,7 +157,9 @@ class JEModel(nn.Module):
         dec_h_fused = F.relu(self.post_retr_proj(dec_h_fused))
 
         flat_dec = dec_h_fused.reshape(B * T, self.hidden_dim)
-        logits_flat = self.pointer(flat_dec, catalog_embeddings)
+        # Choose catalog embeddings (internal trainable if available)
+        cat_for_pointer = self.catalog_param if (self._learn_catalog and hasattr(self, "catalog_param")) else catalog_embeddings
+        logits_flat = self.pointer(flat_dec, cat_for_pointer)
         pointer_logits = logits_flat.reshape(B, T, -1)
 
         side_logits = self.side_head(dec_h_fused)

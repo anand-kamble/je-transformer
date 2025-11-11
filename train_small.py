@@ -117,6 +117,15 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--flow-weight", type=float, default=0.05)
+    # Pointer/logit scaling and catalog options
+    parser.add_argument("--pointer-temp", type=float, default=0.1, help="Pointer softmax temperature (smaller -> larger logits)")
+    parser.add_argument("--pointer-scale-init", type=float, default=10.0, help="Initial multiplicative scale for pointer logits")
+    parser.add_argument("--learnable-pointer-scale", action="store_true", help="Make pointer logit scale learnable")
+    parser.add_argument("--no-pointer-norm", action="store_true", help="Disable L2 normalization in pointer layer")
+    parser.add_argument("--trainable-catalog", action="store_true", help="Make catalog embeddings trainable inside model")
+    # Flow warmup
+    parser.add_argument("--flow-warmup-epochs", type=int, default=3, help="Epochs to apply warmup multiplier to flow loss")
+    parser.add_argument("--flow-warmup-multiplier", type=float, default=5.0, help="Multiplier for flow loss during warmup")
     parser.add_argument("--limit", type=int, default=20000, help="Train on first N examples only")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--wandb-project", type=str, default="je-transformer", help="W&B project name")
@@ -174,6 +183,13 @@ def main() -> None:
                     "epochs": args.epochs,
                     "lr": args.lr,
                     "flow_weight": args.flow_weight,
+                    "pointer_temp": args.pointer_temp,
+                    "pointer_scale_init": args.pointer_scale_init,
+                    "learnable_pointer_scale": args.learnable_pointer_scale,
+                    "pointer_use_norm": not args.no_pointer_norm,
+                    "trainable_catalog": args.trainable_catalog,
+                    "flow_warmup_epochs": args.flow_warmup_epochs,
+                    "flow_warmup_multiplier": args.flow_warmup_multiplier,
                     "limit": args.limit,
                     "seed": args.seed,
                 },
@@ -370,7 +386,21 @@ def main() -> None:
     cat_emb = build_catalog_embeddings(artifact, emb_dim=args.hidden_dim, device=device)
 
 
-    model = JEModel(encoder_loc=args.encoder, hidden_dim=args.hidden_dim, max_lines=args.max_lines, temperature=1.0).to(device)
+    model = JEModel(
+        encoder_loc=args.encoder,
+        hidden_dim=args.hidden_dim,
+        max_lines=args.max_lines,
+        temperature=float(args.pointer_temp),
+        pointer_scale_init=float(args.pointer_scale_init),
+        pointer_learnable_scale=bool(args.learnable_pointer_scale),
+        use_pointer_norm=not args.no_pointer_norm,
+        learn_catalog=bool(args.trainable_catalog),
+    ).to(device)
+    if args.trainable_catalog:
+        try:
+            model.set_catalog_embeddings(cat_emb)
+        except Exception as e:
+            print(f"Warning: failed to register trainable catalog embeddings: {e}")
     
     # Monitor model with wandb.watch() (always enabled when wandb is enabled)
     if wandb_enabled:
@@ -438,6 +468,8 @@ def main() -> None:
 
             # These use the pre-computed probabilities
             cov = coverage_penalty(outputs["pointer_logits"], probs=pointer_probs) * 0.01     # Modify function
+            # Flow loss with warmup schedule
+            flow_weight_now = float(args.flow_weight) * (float(args.flow_warmup_multiplier) if epoch < int(args.flow_warmup_epochs) else 1.0)
             flow = flow_aux_loss(
                 outputs["pointer_logits"],
                 outputs["side_logits"],
@@ -447,7 +479,7 @@ def main() -> None:
                 credit_weights,
                 pointer_probs=pointer_probs,
                 side_probs=side_probs,
-            ) * float(args.flow_weight)
+            ) * flow_weight_now
 
 
             total = pl + sl + stl + cov + flow
@@ -468,6 +500,14 @@ def main() -> None:
 
 
             if step % 100 == 0:
+                # Pointer logit stats for diagnostics
+                try:
+                    p_logits = outputs["pointer_logits"].detach()
+                    p_max = float(p_logits.max().item())
+                    p_min = float(p_logits.min().item())
+                    p_std = float(p_logits.std().item())
+                except Exception:
+                    p_max = p_min = p_std = 0.0
                 metric_set_f1.update_state(
                     outputs["pointer_logits"].detach().cpu(),
                     outputs["side_logits"].detach().cpu(),
@@ -476,7 +516,7 @@ def main() -> None:
                     target_stop_id.detach().cpu(),
                 )
                 print(
-                    f"step {step} loss={total.item():.4f} ptr={pl.item():.4f} side={sl.item():.4f} stop={stl.item():.4f} cov={cov.item():.4f} flow={flow.item():.4f} setF1={metric_set_f1.result().item():.4f}"
+                    f"step {step} loss={total.item():.4f} ptr={pl.item():.4f} side={sl.item():.4f} stop={stl.item():.4f} cov={cov.item():.4f} flow={flow.item():.4f} setF1={metric_set_f1.result().item():.4f} pmax={p_max:.3f} pstd={p_std:.3f}"
                 )
                 # Log metrics to wandb
                 if wandb_enabled:
@@ -492,6 +532,10 @@ def main() -> None:
                             "train/flow_loss": flow.item(),
                             "train/set_f1": metric_set_f1.result().item(),
                             "train/learning_rate": args.lr,
+                            "train/pointer_logit_max": p_max,
+                            "train/pointer_logit_min": p_min,
+                            "train/pointer_logit_std": p_std,
+                            "train/flow_weight_now": flow_weight_now,
                         })
                     except Exception as e:
                         print(f"Warning: Failed to log to wandb: {e}")
@@ -528,7 +572,11 @@ def main() -> None:
                         "hidden_dim": args.hidden_dim,
                         "max_lines": args.max_lines,
                         "max_length": args.max_length,
-                        "temperature": 1.0,
+                        "temperature": float(args.pointer_temp),
+                        "pointer_scale_init": float(args.pointer_scale_init),
+                        "learnable_pointer_scale": bool(args.learnable_pointer_scale),
+                        "pointer_use_norm": not args.no_pointer_norm,
+                        "trainable_catalog": bool(args.trainable_catalog),
                     }, f, indent=2)
                 # 3. Save accounts artifact
                 accounts_path = os.path.join(tmpdir, "accounts_artifact.json")
@@ -552,6 +600,13 @@ def main() -> None:
                             "epochs": args.epochs,
                             "lr": args.lr,
                             "flow_weight": args.flow_weight,
+                            "pointer_temp": args.pointer_temp,
+                            "pointer_scale_init": args.pointer_scale_init,
+                            "learnable_pointer_scale": args.learnable_pointer_scale,
+                            "pointer_use_norm": not args.no_pointer_norm,
+                            "trainable_catalog": args.trainable_catalog,
+                            "flow_warmup_epochs": args.flow_warmup_epochs,
+                            "flow_warmup_multiplier": args.flow_warmup_multiplier,
                             "limit": args.limit,
                             "seed": args.seed,
                         },
