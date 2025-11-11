@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import sys
 import tempfile
 from typing import Dict, List
 
@@ -26,7 +27,17 @@ import torch
 from google.cloud import storage
 from transformers import AutoModel, AutoTokenizer
 
-from data.text_normalization import normalize_description
+# Ensure project root is on sys.path for local imports when run from notebooks
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+try:
+    from data.text_normalization import normalize_description
+except Exception:
+    # Fallback: simple normalization if project import fails
+    def normalize_description(text: str) -> str:
+        return (text or "").strip().lower()
 
 
 def mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
