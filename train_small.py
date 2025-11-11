@@ -289,17 +289,41 @@ def main() -> None:
                 _, path = src.split("gs://", 1)
                 bucket_name, prefix = path.split("/", 1)
                 bucket = client.bucket(bucket_name)
-                for blob in bucket.list_blobs(prefix=prefix.rstrip("/")):
-                    if blob.name.endswith("/"):
-                        continue
-                    lp = _os.path.join(tmpdir, _os.path.relpath(blob.name, start=prefix.rstrip("/")))
-                    _os.makedirs(_os.path.dirname(lp), exist_ok=True)
-                    blob.download_to_filename(lp)
+                # Download required ScaNN artifacts explicitly (no searching)
+                # Match the files produced by our builder (required for loading):
+                #   - serialized_partitioner.pb (partitioner)
+                #   - scann_config.pb (config)
+                #   - scann_assets.pbtxt (assets manifest)
+                #   - ah_codebook.pb (AH codebook, required due to score_ah() in builder)
+                #   - dataset.npy (embedding dataset; referenced by assets)
+                required_files = [
+                    "serialized_partitioner.pb",
+                    "scann_config.pb",
+                    "scann_assets.pbtxt",
+                    "ah_codebook.pb",
+                    "dataset.npy",
+                ]
+                optional_files = ["hashed_dataset.npy", "datapoint_to_token.npy"]
+                for fname in required_files:
+                    blob = bucket.blob(f"{prefix.rstrip('/')}/{fname}")
+                    if not blob.exists(client):
+                        raise RuntimeError(
+                            f"Missing required ScaNN file '{fname}' at {src}. "
+                            "Ensure the index directory contains the serialized ScaNN files at its root."
+                        )
+                    dest = _os.path.join(tmpdir, fname)
+                    blob.download_to_filename(dest)
+                # Best-effort download of optional artifacts
+                for fname in optional_files:
+                    blob = bucket.blob(f"{prefix.rstrip('/')}/{fname}")
+                    if blob.exists(client):
+                        dest = _os.path.join(tmpdir, fname)
+                        blob.download_to_filename(dest)
                 return tmpdir
             # Load searcher and embeddings
             _idx_dir_local = _download_scann_dir(args.retrieval_index_dir)
             # Validate expected ScaNN files exist at the directory root
-            _required = ["scann_searcher.pb", "serialized_partitioner.pb"]
+            _required = ["serialized_partitioner.pb", "scann_config.pb", "scann_assets.pbtxt"]
             _missing = [f for f in _required if not __import__("os").path.exists(__import__("os").path.join(_idx_dir_local, f))]
             if _missing:
                 _lst = ", ".join(sorted(_missing))
