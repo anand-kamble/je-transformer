@@ -200,8 +200,6 @@ def main() -> None:
                     "flow_warmup_epochs": args.flow_warmup_epochs,
                     "flow_warmup_multiplier": args.flow_warmup_multiplier,
                     "retrieval_index_dir": args.retrieval_index_dir,
-                    "retrieval_ids_uri": args.retrieval_ids_uri,
-                    "retrieval_embeddings_uri": args.retrieval_embeddings_uri,
                     "retrieval_top_k": args.retrieval_top_k,
                     "retrieval_use_cls": args.retrieval_use_cls,
                     "limit": args.limit,
@@ -329,6 +327,34 @@ def main() -> None:
                         except Exception:
                             sz = -1
                         print(f"[retrieval]   downloaded optional '{fname}' ({sz} bytes)")
+                # Rewrite scann_assets.pbtxt to ensure relative paths (avoid serialized tmp paths)
+                try:
+                    assets_path = _os.path.join(tmpdir, "scann_assets.pbtxt")
+                    if _os.path.exists(assets_path):
+                        with open(assets_path, "r", encoding="utf-8") as af:
+                            txt = af.read()
+                        before = txt
+                        # Normalize any embedded absolute tmp paths to basenames
+                        import re as _re
+                        def _basename_repl(match):
+                            path_str = match.group(1)
+                            base = _os.path.basename(path_str)
+                            return f"\"{base}\""
+                        txt = _re.sub(r"\"(/tmp/[^\"]+)\"", _basename_repl, txt)
+                        # Also handle generic absolute paths by collapsing to basename
+                        def _basename_repl_generic(match):
+                            path_str = match.group(1)
+                            if path_str.startswith("/"):
+                                base = _os.path.basename(path_str)
+                                return f"\"{base}\""
+                            return f"\"{path_str}\""
+                        txt = _re.sub(r"\"([^\"]+/[^\"]+)\"", _basename_repl_generic, txt)
+                        if txt != before:
+                            with open(assets_path, "w", encoding="utf-8") as af:
+                                af.write(txt)
+                            print("[retrieval] Rewrote scann_assets.pbtxt to use relative paths.")
+                except Exception as e:
+                    print(f"[retrieval] Warning: failed to rewrite scann_assets.pbtxt: {e}")
                 return tmpdir
             # Load searcher and embeddings
             print(f"[retrieval] Using retrieval index dir: {args.retrieval_index_dir}")
@@ -596,8 +622,6 @@ def main() -> None:
                         "pointer_use_norm": not args.no_pointer_norm,
                         "trainable_catalog": bool(args.trainable_catalog),
                         "retrieval_index_dir": args.retrieval_index_dir,
-                        "retrieval_ids_uri": args.retrieval_ids_uri,
-                        "retrieval_embeddings_uri": args.retrieval_embeddings_uri,
                         "retrieval_top_k": int(args.retrieval_top_k),
                         "retrieval_use_cls": bool(args.retrieval_use_cls),
                     }, f, indent=2)
@@ -631,8 +655,6 @@ def main() -> None:
                             "flow_warmup_epochs": args.flow_warmup_epochs,
                             "flow_warmup_multiplier": args.flow_warmup_multiplier,
                             "retrieval_index_dir": args.retrieval_index_dir,
-                            "retrieval_ids_uri": args.retrieval_ids_uri,
-                            "retrieval_embeddings_uri": args.retrieval_embeddings_uri,
                             "retrieval_top_k": args.retrieval_top_k,
                             "retrieval_use_cls": args.retrieval_use_cls,
                             "limit": args.limit,

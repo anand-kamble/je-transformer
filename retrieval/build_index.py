@@ -177,6 +177,28 @@ def main():
                 print(f"    {f}  ({sz} bytes)")
         except Exception as e:
             print(f"[build_index] Warning: failed to list tmpdir contents: {e}")
+        # Rewrite asset paths to be relative (avoid absolute tmp paths baked into assets)
+        try:
+            assets_path = os.path.join(tmpdir, "scann_assets.pbtxt")
+            if os.path.exists(assets_path):
+                with open(assets_path, "r", encoding="utf-8") as af:
+                    assets_txt = af.read()
+                before = assets_txt
+                # Replace any absolute tmpdir references with just the basename
+                assets_txt = assets_txt.replace(tmpdir.rstrip("/") + "/", "")
+                # Basic safety: ensure we no longer reference tmpdir
+                if tmpdir in assets_txt:
+                    print("[build_index] Warning: tmpdir path still present in scann_assets.pbtxt after rewrite.")
+                if assets_txt != before:
+                    with open(assets_path, "w", encoding="utf-8") as af:
+                        af.write(assets_txt)
+                    print("[build_index] Rewrote scann_assets.pbtxt to use relative paths.")
+                else:
+                    print("[build_index] scann_assets.pbtxt already uses relative paths.")
+            else:
+                print("[build_index] Warning: scann_assets.pbtxt not found; load may rely on defaults.")
+        except Exception as e:
+            print(f"[build_index] Warning: failed to rewrite scann_assets.pbtxt: {e}")
         # Always write aligned embeddings and ids alongside the index for simplicity
         ids_path = os.path.join(tmpdir, "ids.txt")
         with open(ids_path, "w", encoding="utf-8") as f:
