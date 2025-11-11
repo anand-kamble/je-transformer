@@ -59,7 +59,7 @@ def build_catalog_embeddings(artifact: Dict[str, Any], emb_dim: int, device: tor
     nature = [a.get("nature", "") for a in accounts]
     encoder = CatalogEncoder(emb_dim=emb_dim)
     embs = encoder({"number": number, "name": name, "nature": nature})  # [C, emb_dim]
-    return embs.to(device=device, dtype=torch.float32)
+    return embs.to(device=device, dtype=torch.float32).detach()
 
 
 def main() -> None:
@@ -102,13 +102,13 @@ def main() -> None:
     # Tiny defaults for quick runs
     parser.add_argument("--encoder", type=str, default="prajjwal1/bert-tiny", help="Small HF encoder for speed")
     parser.add_argument("--max-length", type=int, default=64)
-    parser.add_argument("--max-lines", type=int, default=4)
-    parser.add_argument("--hidden-dim", type=int, default=128)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--max-lines", type=int, default=32)
+    parser.add_argument("--hidden-dim", type=int, default=512)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--flow-weight", type=float, default=0.05)
-    parser.add_argument("--limit", type=int, default=200, help="Train on first N examples only")
+    parser.add_argument("--limit", type=int, default=20000, help="Train on first N examples only")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--wandb-project", type=str, default="je-transformer", help="W&B project name")
     parser.add_argument("--wandb-name", type=str, default=None, help="W&B run name (optional)")
@@ -121,6 +121,7 @@ def main() -> None:
 
     # Initialize wandb
     wandb_enabled = not args.no_wandb
+    run_name = None
     if wandb_enabled:
         try:
             wandb.init(
@@ -141,6 +142,12 @@ def main() -> None:
                 },
                 job_type="training",
             )
+            run_name = wandb.run.name
+            # Use run_name to create unique output directory
+            if not args.output_dir.startswith("gs://"):
+                args.output_dir = os.path.join(args.output_dir, run_name)
+                os.makedirs(args.output_dir, exist_ok=True)
+
             # Define custom metrics for better visualization
             wandb.define_metric("step")
             wandb.define_metric("train/*", step_metric="step")
@@ -149,6 +156,13 @@ def main() -> None:
         except Exception as e:
             print(f"Warning: Failed to initialize wandb: {e}")
             wandb_enabled = False
+    else:
+        # If wandb disabled, fallback to timestamp folder for uniqueness
+        import time
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        if not args.output_dir.startswith("gs://"):
+            args.output_dir = os.path.join(args.output_dir, ts)
+            os.makedirs(args.output_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu"))
 
@@ -334,6 +348,7 @@ def main() -> None:
         last_metrics = None
         for features, targets in dl:
             step += 1
+            optimizer.zero_grad(set_to_none=True)
             input_ids = features["input_ids"].to(device)
             attention_mask = features["attention_mask"].to(device)
             prev_account_idx = features["prev_account_idx"].to(device)
@@ -362,10 +377,18 @@ def main() -> None:
                 currency=currency,
                 journal_entry_type=journal_entry_type,
             )
+            
+            # Compute softmax ONCE
+            pointer_probs = torch.softmax(outputs["pointer_logits"], dim=-1)
+            side_probs = torch.softmax(outputs["side_logits"], dim=-1)
+
+            # Pass probabilities instead of logits where applicable
             pl = pointer_loss(outputs["pointer_logits"], target_account_idx, ignore_index=-1)
             sl = side_loss(outputs["side_logits"], target_side_id, ignore_index=-1)
             stl = stop_loss(outputs["stop_logits"], target_stop_id, ignore_index=-1)
-            cov = coverage_penalty(outputs["pointer_logits"]) * 0.01
+
+            # These use the pre-computed probabilities
+            cov = coverage_penalty(outputs["pointer_logits"], probs=pointer_probs) * 0.01     # Modify function
             flow = flow_aux_loss(
                 outputs["pointer_logits"],
                 outputs["side_logits"],
@@ -373,8 +396,13 @@ def main() -> None:
                 debit_weights,
                 credit_indices,
                 credit_weights,
+                pointer_probs=pointer_probs,
+                side_probs=side_probs,
             ) * float(args.flow_weight)
+
             total = pl + sl + stl + cov + flow
+            total.backward()  # No retain_graph needed!
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             
             # Store last metrics for checkpoint
@@ -388,7 +416,7 @@ def main() -> None:
                 "set_f1": metric_set_f1.result().item() if step % 20 == 0 else (last_metrics["set_f1"] if last_metrics else 0.0),
             }
 
-            if step % 20 == 0:
+            if step % 100 == 0:
                 metric_set_f1.update_state(
                     outputs["pointer_logits"].detach().cpu(),
                     outputs["side_logits"].detach().cpu(),

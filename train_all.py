@@ -66,15 +66,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="End-to-end: Ingest Parquet and train JE model (PyTorch)")
     # Ingestion
     parser.add_argument("--project", type=str, default=os.environ.get("GOOGLE_CLOUD_PROJECT"))
-    parser.add_argument("--instance", type=str, default=os.environ.get("DB_INSTANCE_CONNECTION_NAME"))
+    parser.add_argument("--instance", type=str, default=os.environ.get("DB_INSTANCE_CONNECTION_NAME", "lb01-438216:us-central1:db-3-postgres"))
     parser.add_argument("--db", type=str, default=os.environ.get("DB_NAME", "postgres"))
-    parser.add_argument("--db-user", type=str, default=os.environ.get("DB_USER"))
-    parser.add_argument("--db-password", type=str, default=os.environ.get("DB_PASSWORD"))
-    parser.add_argument("--db-user-secret", type=str, default=os.environ.get("DB_USER_SECRET_NAME"))
+    parser.add_argument("--db-user", type=str, default=os.environ.get("DB_USER","postgres"))
+    parser.add_argument("--db-password", type=str, default=os.environ.get("DB_PASSWORD","PC=?gB>i6LB5]T9n"))
+    parser.add_argument("--db-user-secret", type=str, default=os.environ.get("DB_USER_SECRET_NAME","lb01-438216-db-3-postgres-user"))
     parser.add_argument("--private-ip", action="store_true")
-    parser.add_argument("--gcs-output-uri", type=str, default=os.environ.get("GCS_OUTPUT_URI"))
+    parser.add_argument("--gcs-output-uri", type=str, default=os.environ.get("GCS_OUTPUT_URI", "./out_all_ingest"))
     parser.add_argument("--gcs-output-uri-secret", type=str, default=os.environ.get("GCS_OUTPUT_URI_SECRET_NAME"))
-    parser.add_argument("--business-id", type=str, default=os.environ.get("BUSINESS_ID"))
+    parser.add_argument("--business-id", type=str, default=os.environ.get("BUSINESS_ID", "bu-651"))
     parser.add_argument("--start-date", type=str, default=os.environ.get("START_DATE"))
     parser.add_argument("--end-date", type=str, default=os.environ.get("END_DATE"))
     parser.add_argument("--shard-size", type=int, default=int(os.environ.get("SHARD_SIZE", "10000")))
@@ -88,9 +88,9 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--flow-weight", type=float, default=0.10)
-    parser.add_argument("--output-dir", type=str, required=True)
+    parser.add_argument("--output-dir", type=str, default=os.environ.get("OUTPUT_DIR", "./out_all"))
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--wandb-project", type=str, default="je-transformer", help="W&B project name (required if wandb enabled)")
+    parser.add_argument("--wandb-project", type=str, default="je-transformer", help="W&B project name")
     parser.add_argument("--wandb-name", type=str, default=None, help="W&B run name (optional)")
     parser.add_argument("--wandb-entity", type=str, default="liebre-ai", help="W&B entity/team name (optional)")
     parser.add_argument("--no-wandb", action="store_true", help="Disable W&B tracking")
@@ -117,11 +117,11 @@ def main() -> None:
 
     with engine.connect() as conn:
         catalog = AccountCatalog.build(conn, tables, business_id=args.business_id)
+        ts = time.strftime("%Y%m%d-%H%M%S")
         from google.cloud import storage
         client = storage.Client()
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
         # Write accounts artifact into run-specific directory
-        accounts_artifact_uri = f"{runs_prefix}/artifacts/accounts_{timestamp}.json"
+        accounts_artifact_uri = f"{runs_prefix}/artifacts/accounts_{ts}.json"
         write_gcs_json(accounts_artifact_uri, catalog.to_artifact(), client)
         # Write parquet shards under run-specific prefix
         manifest = write_parquet_shards(
@@ -129,7 +129,7 @@ def main() -> None:
             tables=tables,
             catalog=catalog,
             gcs_output_uri=runs_prefix,
-            shard_size=args.shard_size,
+            shard_size=int(args.shard_size),
             filters={
                 "business_id": args.business_id,
                 "start_date": None if not args.start_date else __import__("datetime").date.fromisoformat(args.start_date),
@@ -137,58 +137,54 @@ def main() -> None:
             },
         )
         # Save manifest JSON alongside accounts artifact
-        manifest_uri = f"{runs_prefix}/artifacts/manifest_{timestamp}.json"
+        manifest_uri = f"{runs_prefix}/artifacts/manifest_{ts}.json"
         write_gcs_json(manifest_uri, manifest, client)
         parquet_glob = f"{runs_prefix}/parquet/*.parquet"
 
     # Initialize wandb (after ingestion, before training)
-    wandb_enabled = not args.no_wandb and wandb is not None
+    wandb_enabled = not args.no_wandb
     if wandb_enabled:
-        if args.wandb_project is None:
-            print("Warning: --wandb-project not specified, disabling wandb")
-            wandb_enabled = False
-        else:
+        try:
+            wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_name,
+                entity=args.wandb_entity,
+                config={
+                    "encoder": args.encoder,
+                    "hidden_dim": args.hidden_dim,
+                    "max_lines": args.max_lines,
+                    "max_length": args.max_length,
+                    "batch_size": args.batch_size,
+                    "epochs": args.epochs,
+                    "lr": args.lr,
+                    "flow_weight": args.flow_weight,
+                    "seed": args.seed,
+                    "business_id": args.business_id,
+                    "start_date": args.start_date,
+                    "end_date": args.end_date,
+                    "shard_size": args.shard_size,
+                    "run_id": run_id,
+                },
+                job_type="training",
+            )
+            # Define custom metrics for better visualization
+            wandb.define_metric("step")
+            wandb.define_metric("train/*", step_metric="step")
+            wandb.define_metric("epoch")
+            wandb.define_metric("train/*", step_metric="epoch")
+            # Log ingestion metadata (catalog is available from ingestion step above)
             try:
-                wandb.init(
-                    project=args.wandb_project,
-                    name=args.wandb_name,
-                    entity=args.wandb_entity,
-                    config={
-                        "encoder": args.encoder,
-                        "hidden_dim": args.hidden_dim,
-                        "max_lines": args.max_lines,
-                        "max_length": args.max_length,
-                        "batch_size": args.batch_size,
-                        "epochs": args.epochs,
-                        "lr": args.lr,
-                        "flow_weight": args.flow_weight,
-                        "seed": args.seed,
-                        "business_id": args.business_id,
-                        "start_date": args.start_date,
-                        "end_date": args.end_date,
-                        "shard_size": args.shard_size,
-                        "run_id": run_id,
-                    },
-                    job_type="training",
-                )
-                # Define custom metrics for better visualization
-                wandb.define_metric("step")
-                wandb.define_metric("train/*", step_metric="step")
-                wandb.define_metric("epoch")
-                wandb.define_metric("train/*", step_metric="epoch")
-                # Log ingestion metadata (catalog is available from ingestion step above)
-                try:
-                    artifact_data = load_json_from_uri(accounts_artifact_uri)
-                    accounts_count = len(artifact_data.get("accounts", []))
-                    wandb.log({
-                        "ingestion/accounts_count": accounts_count,
-                        "ingestion/parquet_shards": manifest.get("num_shards", 0) if manifest else 0,
-                    })
-                except Exception as e:
-                    print(f"Warning: Failed to log ingestion metadata: {e}")
+                artifact_data = load_json_from_uri(accounts_artifact_uri)
+                accounts_count = len(artifact_data.get("accounts", []))
+                wandb.log({
+                    "ingestion/accounts_count": accounts_count,
+                    "ingestion/parquet_shards": manifest.get("num_shards", 0) if manifest else 0,
+                })
             except Exception as e:
-                print(f"Warning: Failed to initialize wandb: {e}")
-                wandb_enabled = False
+                print(f"Warning: Failed to log ingestion metadata: {e}")
+        except Exception as e:
+            print(f"Warning: Failed to initialize wandb: {e}")
+            wandb_enabled = False
 
     # Train
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu"))
@@ -258,7 +254,7 @@ def main() -> None:
                 credit_weights,
             ) * float(args.flow_weight)
             total = pl + sl + stl + cov + flow
-            total.backward()
+            total.backward(retain_graph=True)
             optimizer.step()
             
             # Store last metrics for checkpoint
@@ -353,7 +349,6 @@ def main() -> None:
                     "epoch": epoch + 1,
                     "step": global_step,
                     "total_steps": len(dl) * (epoch + 1),
-                    "run_id": run_id,
                     "hyperparameters": {
                         "encoder": args.encoder,
                         "hidden_dim": args.hidden_dim,
@@ -383,7 +378,6 @@ def main() -> None:
                             "step": global_step,
                             "set_f1": current_metrics["set_f1"],
                             "loss": current_metrics["loss"],
-                            "run_id": run_id,
                         }
                     )
                     artifact.add_file(ckpt_path, name="checkpoint.pt")
@@ -395,39 +389,38 @@ def main() -> None:
                     print(f"Warning: Failed to log wandb artifact: {e}")
             
             # 6. Also save to local/gs:// for backward compatibility
+            os.makedirs(args.output_dir, exist_ok=True) if not args.output_dir.startswith("gs://") else None
+            local_ckpt_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}.pt") if not args.output_dir.startswith("gs://") else f"/tmp/checkpoint_epoch_{epoch+1}.pt"
+            
+            # Copy checkpoint to final location
+            shutil.copy2(ckpt_path, local_ckpt_path)
+            
             if args.output_dir.startswith("gs://"):
-                from google.cloud import storage as _storage
-                _client = _storage.Client()
+                from google.cloud import storage
+
+                client = storage.Client()
                 _, path = args.output_dir.split("gs://", 1)
                 bucket_name, prefix = path.split("/", 1)
-                run_prefix_local = f"{prefix.rstrip('/')}/runs/{run_id}"
-                local_ckpt_path = os.path.join(tmpdir, f"checkpoint_epoch_{epoch+1}.pt")
-                blob = _client.bucket(bucket_name).blob(f"{run_prefix_local}/checkpoint_epoch_{epoch+1}.pt")
-                blob.upload_from_filename(ckpt_path)
-            else:
-                run_dir = os.path.join(args.output_dir, "runs", run_id)
-                os.makedirs(run_dir, exist_ok=True)
-                local_ckpt_path = os.path.join(run_dir, f"checkpoint_epoch_{epoch+1}.pt")
-                shutil.copy2(ckpt_path, local_ckpt_path)
+                blob = client.bucket(bucket_name).blob(f"{prefix.rstrip('/')}/checkpoint_epoch_{epoch+1}.pt")
+                blob.upload_from_filename(local_ckpt_path)
 
-    # Save final checkpoint to a unique run directory (consistent with runs_prefix)
+    # Save final checkpoint
     if args.output_dir.startswith("gs://"):
-        tmp_ckpt = "/tmp/model_state.pt"
-        torch.save({"model": model.state_dict()}, tmp_ckpt)
-        from google.cloud import storage as _storage
-        _client = _storage.Client()
+        tmp = "/tmp/model_state.pt"
+        torch.save({"model": model.state_dict()}, tmp)
+        from google.cloud import storage
+
+        client = storage.Client()
         _, path = args.output_dir.split("gs://", 1)
         bucket_name, prefix = path.split("/", 1)
-        run_prefix_local = f"{prefix.rstrip('/')}/runs/{run_id}"
-        blob = _client.bucket(bucket_name).blob(f"{run_prefix_local}/model_state.pt")
-        blob.upload_from_filename(tmp_ckpt)
-        print(f"Saved model checkpoint to gs://{bucket_name}/{run_prefix_local}/model_state.pt")
+        blob = client.bucket(bucket_name).blob(f"{prefix.rstrip('/')}/model_state.pt")
+        blob.upload_from_filename(tmp)
+        print(f"Uploaded checkpoint to {args.output_dir}")
     else:
-        run_dir = os.path.join(args.output_dir, "runs", run_id)
-        os.makedirs(run_dir, exist_ok=True)
-        ckpt_path = os.path.join(run_dir, "model_state.pt")
-        torch.save({"model": model.state_dict()}, ckpt_path)
-        print(f"Saved model checkpoint to {ckpt_path}")
+        os.makedirs(args.output_dir, exist_ok=True)
+        ckpt = os.path.join(args.output_dir, "model_state.pt")
+        torch.save({"model": model.state_dict()}, ckpt)
+        print(f"Checkpoint written to {ckpt}")
     
     # Log final summary to wandb
     if wandb_enabled:
@@ -436,11 +429,12 @@ def main() -> None:
                 "final_epoch": args.epochs,
                 "final_step": global_step,
                 "final_set_f1": metric_set_f1.result().item(),
-                "run_id": run_id,
             })
             wandb.finish()
         except Exception as e:
             print(f"Warning: Failed to update wandb summary: {e}")
 
 
+if __name__ == "__main__":
+    main()
 

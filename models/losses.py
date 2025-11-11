@@ -42,15 +42,9 @@ def stop_loss(stop_logits: torch.Tensor, target_stop_id: torch.Tensor, ignore_in
     return masked_sparse_ce(stop_logits, target_stop_id, ignore_index=ignore_index)
 
 
-def coverage_penalty(pointer_logits: torch.Tensor, max_total: float = 1.0) -> torch.Tensor:
-    """
-    Encourage the model not to overspread mass repeatedly on the same accounts across time.
-    Compute softmax over accounts per step, sum over time per account, and penalize surplus over max_total.
-      - pointer_logits: [B, T, C]
-    Returns mean surplus across batch.
-    """
-    p = torch.softmax(pointer_logits, dim=-1)  # [B, T, C]
-    sum_over_t = p.sum(dim=1)  # [B, C]
+def coverage_penalty(pointer_logits: torch.Tensor, max_total: float = 1.0, probs: Optional[torch.Tensor] = None) -> torch.Tensor:
+    p = probs if probs is not None else torch.softmax(pointer_logits, dim=-1)
+    sum_over_t = p.sum(dim=1)
     surplus = torch.clamp(sum_over_t - max_total, min=0.0)
     return surplus.sum(dim=-1).mean()
 
@@ -211,37 +205,50 @@ def flow_aux_loss(
     debit_weights: torch.Tensor,
     credit_indices: torch.Tensor,
     credit_weights: torch.Tensor,
+    pointer_probs: Optional[torch.Tensor] = None,
+    side_probs: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Align predicted per-side mass over accounts with normalized debit/credit amounts.
+    
     - pointer_logits: [B, T, C]
     - side_logits: [B, T, 2]
-    - debit_indices: [B, D] int64 indices into catalog (pad with -1)
-    - debit_weights: [B, D] float (should sum to 1 per row; zeros if no debits)
-    - credit_indices: [B, K] int64 (pad with -1)
-    - credit_weights: [B, K] float (sum to 1 per row; zeros if no credits)
+    - debit_indices: [B, D] (int64 indices into catalog; pad with -1)
+    - debit_weights: [B, D] (float; should sum to 1 per row; zeros if no debits)
+    - credit_indices: [B, K] (int64; pad with -1)
+    - credit_weights: [B, K] (float; sum to 1 per row; zeros if no credits)
+    - pointer_probs: Optional pre-computed softmax(pointer_logits, dim=-1)
+    - side_probs: Optional pre-computed softmax(side_logits, dim=-1)
+    
     Returns mean of per-side MSE across valid rows.
     """
-    p = torch.softmax(pointer_logits, dim=-1)  # [B, T, C]
-    s = torch.softmax(side_logits, dim=-1)     # [B, T, 2]
-    pred_debit_mass = (s[:, :, 0].unsqueeze(-1) * p).sum(dim=1)   # [B, C]
+    # Use pre-computed probabilities if provided, otherwise compute
+    p = pointer_probs if pointer_probs is not None else torch.softmax(pointer_logits, dim=-1)  # [B, T, C]
+    s = side_probs if side_probs is not None else torch.softmax(side_logits, dim=-1)  # [B, T, 2]
+    
+    # Predicted mass per account for each side
+    pred_debit_mass = (s[:, :, 0].unsqueeze(-1) * p).sum(dim=1)  # [B, C]
     pred_credit_mass = (s[:, :, 1].unsqueeze(-1) * p).sum(dim=1)  # [B, C]
-
+    
     def side_mse(pred_mass: torch.Tensor, idxs: torch.Tensor, wts: torch.Tensor) -> torch.Tensor:
         idxs = idxs.clone()
         mask = (idxs >= 0).to(pred_mass.dtype)
-        idxs_clamped = idxs.clamp_min(0)
+        idxs_clamped = idxs.clamp(min=0)
         gathered = torch.gather(pred_mass, 1, idxs_clamped)  # [B, L]
+        
+        # Normalize gathered predictions
         sum_g = gathered.sum(dim=-1, keepdim=True) + 1e-8
         g_norm = torch.where(sum_g > 0, gathered / sum_g, torch.zeros_like(gathered))
-        # Normalize target weights to sum 1 over non-negative indices
+        
+        # Normalize weights
         wts = torch.where(mask > 0, wts, torch.zeros_like(wts))
         sum_w = wts.sum(dim=-1, keepdim=True) + 1e-8
         w_norm = torch.where(sum_w > 0, wts / sum_w, torch.zeros_like(wts))
+        
         mse = ((g_norm - w_norm) ** 2).mean(dim=-1)  # [B]
         valid = (mask.sum(dim=-1) > 0).to(mse.dtype)
         return (mse * valid).sum() / (valid.sum() + 1e-6)
-
-    l_d = side_mse(pred_debit_mass, debit_indices, debit_weights)
-    l_c = side_mse(pred_credit_mass, credit_indices, credit_weights)
-    return 0.5 * (l_d + l_c)
+    
+    ld = side_mse(pred_debit_mass, debit_indices, debit_weights)
+    lc = side_mse(pred_credit_mass, credit_indices, credit_weights)
+    return 0.5 * (ld + lc)

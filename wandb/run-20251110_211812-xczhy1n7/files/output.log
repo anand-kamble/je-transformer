@@ -1,0 +1,27 @@
+Database URL: postgresql://postgres:PC%3D%3FgB%3Ei6LB5%5DT9n@localhost:4000/liebre_dev
+[ingest] SQLAlchemy engine created via PostgresConnection (db=liebre_dev)
+[ingest] Using tables: journal_entry=journal_entry entry_line=entry_line ledger_account=ledger_account schema=public
+[ingest] Reflecting table: journal_entry
+[ingest] Reflected table journal_entry columns=['journal_entry_id', 'business_id', 'year_month', 'date', 'number', 'description', 'currency', 'journal_entry_type', 'journal_entry_sub_type', 'journal_entry_status', 'journal_entry_origin']
+[ingest] Reflecting table: entry_line
+[ingest] Reflected table entry_line columns=['entry_line_id', 'journal_entry_id', 'ledger_account_id', 'index', 'description', 'debit', 'credit', 'exchange_rate']
+[ingest] Reflecting table: ledger_account
+[ingest] Reflected table ledger_account columns=['ledger_account_id', 'business_id', 'number', 'name', 'parent_ledger_account_id', 'currency', 'nature', 'ledger_account_type', 'ledger_account_sub_type', 'ledger_account_sub_sub_type', 'ledger_account_status', 'foreign_exchange_adjustment_ledger_account_id', 'cash_flow_group', 'added_date', 'removed_date', 'is_used_in_journal_entries']
+[ingest] Building account catalog (business_id=bu-651)
+[ingest] Catalog rows loaded: 575
+[ingest] Serializing account catalog (num_accounts=575)
+[ingest] Building join (business_id=bu-651, start_date=None, end_date=None)
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-211822.json
+Traceback (most recent call last):
+  File "/home/iunme/je-transformer/train_small.py", line 557, in <module>
+    main()
+  File "/home/iunme/je-transformer/train_small.py", line 378, in main
+    total.backward()
+  File "/home/iunme/je-transformer/.venv/lib/python3.12/site-packages/torch/_tensor.py", line 625, in backward
+    torch.autograd.backward(
+  File "/home/iunme/je-transformer/.venv/lib/python3.12/site-packages/torch/autograd/__init__.py", line 354, in backward
+    _engine_run_backward(
+  File "/home/iunme/je-transformer/.venv/lib/python3.12/site-packages/torch/autograd/graph.py", line 841, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: Trying to backward through the graph a second time (or directly access saved tensors after they have already been freed). Saved intermediate values of the graph are freed when you call .backward() or autograd.grad(). Specify retain_graph=True if you need to backward through the graph a second time or if you need to access saved tensors after calling backward.

@@ -1,0 +1,92 @@
+_wandb:
+    value:
+        cli_version: 0.22.3
+        e:
+            fczokw07sb9gud81cwceiydtuaylrvmg:
+                codePath: train_small.py
+                codePathLocal: train_small.py
+                cpu_count: 3
+                cpu_count_logical: 6
+                cudaVersion: "13.0"
+                disk:
+                    /:
+                        total: "41956900864"
+                        used: "13717217280"
+                email: akamble@liebre.ai
+                executable: /home/iunme/je-transformer/.venv/bin/python
+                git:
+                    commit: a4e561ab435f00bda9443925b29c118b76023ce7
+                    remote: https://github.com/anand-kamble/je-transformer/
+                gpu: NVIDIA GeForce RTX 3050 Ti Laptop GPU
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ampere
+                      memoryTotal: "4294967296"
+                      name: NVIDIA GeForce RTX 3050 Ti Laptop GPU
+                      uuid: GPU-bf1f8682-3a67-e56a-3ddd-b99e39286c0a
+                host: Anand
+                memory:
+                    total: "6218518528"
+                os: Linux-5.15.167.4-microsoft-standard-WSL2-x86_64-with-glibc2.39
+                program: /home/iunme/je-transformer/train_small.py
+                python: CPython 3.12.3
+                root: /home/iunme/je-transformer
+                startedAt: "2025-11-11T05:02:16.463425Z"
+                writerId: fczokw07sb9gud81cwceiydtuaylrvmg
+        m:
+            - "1": step
+              "6":
+                - 3
+              "7": []
+            - "1": epoch
+              "6":
+                - 3
+              "7": []
+            - "2": train/*
+              "5": 2
+              "6":
+                - 1
+              "7": []
+        python_version: 3.12.3
+        t:
+            "1":
+                - 1
+                - 11
+                - 49
+            "2":
+                - 1
+                - 2
+                - 3
+                - 11
+                - 49
+            "3":
+                - 1
+                - 2
+                - 7
+                - 16
+                - 62
+            "4": 3.12.3
+            "5": 0.22.3
+            "6": 4.57.1
+            "12": 0.22.3
+            "13": linux-x86_64
+batch_size:
+    value: 16
+encoder:
+    value: prajjwal1/bert-tiny
+epochs:
+    value: 30
+flow_weight:
+    value: 0.05
+hidden_dim:
+    value: 128
+limit:
+    value: 200
+lr:
+    value: 0.0003
+max_length:
+    value: 64
+max_lines:
+    value: 4
+seed:
+    value: 0

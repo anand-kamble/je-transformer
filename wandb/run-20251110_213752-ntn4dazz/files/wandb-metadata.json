@@ -1,0 +1,39 @@
+{
+  "os":  "Linux-5.15.167.4-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+  "python":  "CPython 3.12.3",
+  "startedAt":  "2025-11-11T05:37:52.489400Z",
+  "program":  "/home/iunme/je-transformer/train_small.py",
+  "codePath":  "train_small.py",
+  "codePathLocal":  "train_small.py",
+  "git":  {
+    "remote":  "https://github.com/anand-kamble/je-transformer/",
+    "commit":  "a4e561ab435f00bda9443925b29c118b76023ce7"
+  },
+  "email":  "akamble@liebre.ai",
+  "root":  "/home/iunme/je-transformer",
+  "host":  "Anand",
+  "executable":  "/home/iunme/je-transformer/.venv/bin/python",
+  "cpu_count":  3,
+  "cpu_count_logical":  6,
+  "gpu":  "NVIDIA GeForce RTX 3050 Ti Laptop GPU",
+  "gpu_count":  1,
+  "disk":  {
+    "/":  {
+      "total":  "41956900864",
+      "used":  "16635076608"
+    }
+  },
+  "memory":  {
+    "total":  "6218518528"
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA GeForce RTX 3050 Ti Laptop GPU",
+      "memoryTotal":  "4294967296",
+      "architecture":  "Ampere",
+      "uuid":  "GPU-bf1f8682-3a67-e56a-3ddd-b99e39286c0a"
+    }
+  ],
+  "cudaVersion":  "13.0",
+  "writerId":  "bmlaqadfrissou6vmt64t5bs06upjvie"
+}

@@ -1,0 +1,68 @@
+Database URL: postgresql://postgres:PC%3D%3FgB%3Ei6LB5%5DT9n@localhost:4000/liebre_dev
+[ingest] SQLAlchemy engine created via PostgresConnection (db=liebre_dev)
+[ingest] Using tables: journal_entry=journal_entry entry_line=entry_line ledger_account=ledger_account schema=public
+[ingest] Reflecting table: journal_entry
+[ingest] Reflected table journal_entry columns=['journal_entry_id', 'business_id', 'year_month', 'date', 'number', 'description', 'currency', 'journal_entry_type', 'journal_entry_sub_type', 'journal_entry_status', 'journal_entry_origin']
+[ingest] Reflecting table: entry_line
+[ingest] Reflected table entry_line columns=['entry_line_id', 'journal_entry_id', 'ledger_account_id', 'index', 'description', 'debit', 'credit', 'exchange_rate']
+[ingest] Reflecting table: ledger_account
+[ingest] Reflected table ledger_account columns=['ledger_account_id', 'business_id', 'number', 'name', 'parent_ledger_account_id', 'currency', 'nature', 'ledger_account_type', 'ledger_account_sub_type', 'ledger_account_sub_sub_type', 'ledger_account_status', 'foreign_exchange_adjustment_ledger_account_id', 'cash_flow_group', 'added_date', 'removed_date', 'is_used_in_journal_entries']
+[ingest] Building account catalog (business_id=bu-651)
+[ingest] Catalog rows loaded: 575
+[ingest] Serializing account catalog (num_accounts=575)
+[ingest] Building join (business_id=bu-651, start_date=None, end_date=None)
+config.json: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 285/285 [00:00<00:00, 1.53MB/s]
+vocab.txt: 232kB [00:00, 9.26MB/s]
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+pytorch_model.bin: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 17.8M/17.8M [00:01<00:00, 15.9MB/s]
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+model.safetensors: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 17.7M/17.7M [00:00<00:00, 23.6MB/s]
+step 20 loss=7.7751 ptr=6.3652 side=0.7221 stop=0.6834 cov=0.0000 flow=0.0044 setF1=0.0000
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+step 40 loss=7.7751 ptr=6.3541 side=0.7288 stop=0.6849 cov=0.0000 flow=0.0072 setF1=0.0000
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+step 60 loss=7.7797 ptr=6.3450 side=0.7474 stop=0.6820 cov=0.0000 flow=0.0052 setF1=0.0000
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+step 80 loss=7.7882 ptr=6.3515 side=0.7485 stop=0.6845 cov=0.0000 flow=0.0038 setF1=0.0000
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+step 100 loss=7.7577 ptr=6.3421 side=0.7232 stop=0.6903 cov=0.0000 flow=0.0021 setF1=0.0000
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+step 120 loss=7.8083 ptr=6.3773 side=0.7360 stop=0.6882 cov=0.0000 flow=0.0068 setF1=0.0000
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+step 140 loss=7.7642 ptr=6.3417 side=0.7411 stop=0.6778 cov=0.0000 flow=0.0037 setF1=0.0000
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+step 160 loss=7.7783 ptr=6.3498 side=0.7369 stop=0.6854 cov=0.0000 flow=0.0063 setF1=0.0000
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+step 180 loss=7.7673 ptr=6.3424 side=0.7342 stop=0.6851 cov=0.0000 flow=0.0056 setF1=0.0000
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+step 200 loss=7.7580 ptr=6.3473 side=0.7162 stop=0.6894 cov=0.0000 flow=0.0051 setF1=0.0000
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+step 220 loss=7.7603 ptr=6.3334 side=0.7406 stop=0.6842 cov=0.0000 flow=0.0021 setF1=0.0000
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+step 240 loss=7.7695 ptr=6.3431 side=0.7358 stop=0.6887 cov=0.0000 flow=0.0020 setF1=0.0000
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+step 260 loss=7.7648 ptr=6.3445 side=0.7254 stop=0.6867 cov=0.0000 flow=0.0081 setF1=0.0000
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+step 280 loss=7.7759 ptr=6.3514 side=0.7370 stop=0.6855 cov=0.0000 flow=0.0020 setF1=0.0000
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+step 300 loss=7.7691 ptr=6.3404 side=0.7307 stop=0.6939 cov=0.0000 flow=0.0041 setF1=0.0000
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+step 320 loss=7.8158 ptr=6.3594 side=0.7611 stop=0.6899 cov=0.0000 flow=0.0055 setF1=0.0000
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+step 340 loss=7.7528 ptr=6.3343 side=0.7337 stop=0.6831 cov=0.0000 flow=0.0018 setF1=0.0017
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+step 360 loss=7.7902 ptr=6.3519 side=0.7423 stop=0.6882 cov=0.0000 flow=0.0077 setF1=0.0016
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+step 380 loss=7.7895 ptr=6.3718 side=0.7168 stop=0.6927 cov=0.0000 flow=0.0082 setF1=0.0015
+Loading JSON from URI: ./out_small_ingest/artifacts/accounts_20251110-210227.json
+Checkpoint written to ./out_small/model_state.pt

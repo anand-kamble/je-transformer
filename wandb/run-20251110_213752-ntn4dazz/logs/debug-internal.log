@@ -1,0 +1,11 @@
+{"time":"2025-11-10T21:37:52.707878108-08:00","level":"INFO","msg":"stream: starting","core version":"0.22.3"}
+{"time":"2025-11-10T21:37:54.548595489-08:00","level":"INFO","msg":"stream: created new stream","id":"ntn4dazz"}
+{"time":"2025-11-10T21:37:54.548674809-08:00","level":"INFO","msg":"handler: started","stream_id":"ntn4dazz"}
+{"time":"2025-11-10T21:37:54.548800635-08:00","level":"INFO","msg":"stream: started","id":"ntn4dazz"}
+{"time":"2025-11-10T21:37:54.548844823-08:00","level":"INFO","msg":"sender: started","stream_id":"ntn4dazz"}
+{"time":"2025-11-10T21:37:54.548836564-08:00","level":"INFO","msg":"writer: started","stream_id":"ntn4dazz"}
+{"time":"2025-11-10T21:42:44.999350171-08:00","level":"INFO","msg":"stream: closing","id":"ntn4dazz"}
+{"time":"2025-11-10T21:42:45.425792288-08:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2025-11-10T21:42:45.890868533-08:00","level":"INFO","msg":"handler: closed","stream_id":"ntn4dazz"}
+{"time":"2025-11-10T21:42:45.89147609-08:00","level":"INFO","msg":"sender: closed","stream_id":"ntn4dazz"}
+{"time":"2025-11-10T21:42:45.891513928-08:00","level":"INFO","msg":"stream: closed","id":"ntn4dazz"}
