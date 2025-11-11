@@ -55,7 +55,7 @@ def load_searcher_from_gcs(index_dir: str) -> scann.ScannSearcher:
 
 
 def embed_text(text: str, tokenizer_loc: str, encoder_loc: str, max_length: int = 128, use_cls: bool = False) -> np.ndarray:
-	tokenizer = AutoTokenizer.from_pretrained(tokenizer_loc, use_fast=True)
+	tokenizer = AutoTokenizer.from_pretrained(tokenizer_loc, use_fast=False)
 	encoder = AutoModel.from_pretrained(encoder_loc)
 	encoder.eval()
 	desc = normalize_description(text)

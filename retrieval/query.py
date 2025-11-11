@@ -49,7 +49,7 @@ def read_ids_from_gcs(gcs_uri: str) -> List[str]:
 
 
 def embed_texts(texts: List[str], tokenizer_loc: str, encoder_loc: str, max_length: int, use_cls: bool) -> np.ndarray:
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_loc, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_loc, use_fast=False)
     enc = AutoModel.from_pretrained(encoder_loc).eval()
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu") )
     enc.to(device)

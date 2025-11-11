@@ -60,7 +60,7 @@ def infer(
 ) -> List[Dict[str, Any]]:
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
 
-    tokenizer = AutoTokenizer.from_pretrained(encoder, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(encoder, use_fast=False)
     desc_norm = normalize_description(description)
     tok = tokenizer([desc_norm], padding=True, truncation=True, max_length=max_length, return_tensors="pt")
     input_ids = tok["input_ids"].to(device)

@@ -134,7 +134,7 @@ def test_tokenizer_optional() -> None:
         from models.tokenizer import DescriptionTokenizer
 
         model_name = os.environ.get("HF_MODEL", "bert-base-multilingual-cased")
-        tok = DescriptionTokenizer(model_name_or_path=model_name, max_length=16, use_fast=True)
+        tok = DescriptionTokenizer(model_name_or_path=model_name, max_length=16, use_fast=False)
         out = tok.tokenize_batch(["Hello   world", "Café Corp"])
         assert "input_ids" in out and "attention_mask" in out
         _ok(f"DescriptionTokenizer with model={model_name}")

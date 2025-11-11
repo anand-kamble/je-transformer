@@ -87,7 +87,7 @@ def main():
     frames = [pq.read_table(p).to_pandas(columns=["journal_entry_id", "description"]) for p in paths]
     df = pd.concat(frames, ignore_index=True)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.encoder_loc, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.encoder_loc, use_fast=False)
     encoder = AutoModel.from_pretrained(args.encoder_loc).eval()
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu"))
     encoder.to(device)

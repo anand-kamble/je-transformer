@@ -17,7 +17,7 @@ class DescriptionTokenizer:
         self,
         model_name_or_path: str = "bert-base-multilingual-cased",
         max_length: int = 128,
-        use_fast: bool = True,
+        use_fast: bool = False,
     ) -> None:
         from transformers import \
             AutoTokenizer  # defer import to avoid tooling stub issues
@@ -90,7 +90,7 @@ class DescriptionTokenizer:
                     local_name = os.path.basename(b.name)
                     local_path = os.path.join(tmpdir, local_name)
                     b.download_to_filename(local_path)
-                tok = AutoTokenizer.from_pretrained(tmpdir, use_fast=True)
+                tok = AutoTokenizer.from_pretrained(tmpdir, use_fast=False)
                 obj = cls(model_name_or_path=tmpdir, max_length=max_length)
                 obj.tokenizer = tok
                 return obj

@@ -4,7 +4,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from typing import Any, Dict
+import io
+from typing import Any, Dict, Optional
 
 import torch
 
@@ -34,28 +35,172 @@ def build_catalog_embeddings(artifact: Dict[str, Any], emb_dim: int, device: tor
 	name = [a.get("name", "") for a in accounts]
 	nature = [a.get("nature", "") for a in accounts]
 	encoder = CatalogEncoder(emb_dim=emb_dim)
-	return encoder({"number": number, "name": name, "nature": nature}).to(device=device, dtype=torch.float32)
+	return encoder({"number": number, "name": name, "nature": nature}).to(device=device, dtype=torch.float32).detach()
 
+
+def _uri_join(base: str, name: str) -> str:
+	if base.startswith("gs://"):
+		return f"{base.rstrip('/')}/{name}"
+	return os.path.join(base, name)
+
+
+def _uri_dirname(uri: str) -> str:
+	if uri.startswith("gs://"):
+		# Trim last path segment
+		return uri.rsplit("/", 1)[0]
+	return os.path.dirname(uri)
+
+
+def _uri_exists(uri: str) -> bool:
+	if uri.startswith("gs://"):
+		try:
+			from google.cloud import storage
+			client = storage.Client()
+			_, path = uri.split("gs://", 1)
+			bucket_name, blob_path = path.split("/", 1)
+			blob = client.bucket(bucket_name).blob(blob_path)
+			return blob.exists(client)
+		except Exception:
+			return False
+	return os.path.exists(uri)
+
+
+def load_torch_from_uri(uri: str, map_location: Optional[torch.device] = None) -> Any:
+	if uri.startswith("gs://"):
+		from google.cloud import storage
+		client = storage.Client()
+		_, path = uri.split("gs://", 1)
+		bucket_name, blob_path = path.split("/", 1)
+		blob = client.bucket(bucket_name).blob(blob_path)
+		data = blob.download_as_bytes()
+		return torch.load(io.BytesIO(data), map_location=map_location)
+	return torch.load(uri, map_location=map_location)
+
+def _list_runs_local(root: str):
+	try:
+		entries = []
+		for name in os.listdir(root):
+			p = os.path.join(root, name)
+			if os.path.isdir(p):
+				try:
+					mtime = os.path.getmtime(p)
+				except Exception:
+					mtime = 0.0
+				entries.append((name, mtime))
+		return sorted(entries, key=lambda x: x[1], reverse=True)
+	except FileNotFoundError:
+		return []
+
+def _list_runs_gcs(root: str):
+	from collections import defaultdict
+	try:
+		from google.cloud import storage
+		client = storage.Client()
+		_, path = root.split("gs://", 1)
+		bucket_name, prefix = path.split("/", 1)
+		if not prefix.endswith("/"):
+			prefix = prefix + "/"
+		bucket = client.bucket(bucket_name)
+		# Gather first-level subdirs and their latest updated time
+		latest_ts_by_run = defaultdict(float)
+		for blob in client.list_blobs(bucket, prefix=prefix):
+			# Expect names like prefix + run_name + "/..."
+			name = blob.name
+			if not name.startswith(prefix):
+				continue
+			rem = name[len(prefix):]
+			parts = rem.split("/", 1)
+			if not parts or parts[0] == "":
+				continue
+			rn = parts[0]
+			if getattr(blob, "updated", None):
+				ts = blob.updated.timestamp()
+				if ts > latest_ts_by_run[rn]:
+					latest_ts_by_run[rn] = ts
+		runs = [(rn, ts) for rn, ts in latest_ts_by_run.items()]
+		return sorted(runs, key=lambda x: x[1], reverse=True)
+	except Exception:
+		return []
+
+def list_runs(root: str):
+	if root.startswith("gs://"):
+		return _list_runs_gcs(root)
+	return _list_runs_local(root)
 
 def main() -> None:
 	parser = argparse.ArgumentParser(description="Quick inference test for JE model (PyTorch)")
 	parser.add_argument("--description", type=str, default="CAPITAL SOCIAL", help="Input description to infer on")
-	parser.add_argument("--accounts-artifact", type=str, default="./out_small_ingest/artifacts/accounts_20251109-230650.json", help="Accounts JSON (local or gs://)")
-	parser.add_argument("--checkpoint", type=str, default="./out_small/model_state.pt", help="Optional model_state .pt to load")
+	parser.add_argument("--accounts-artifact", type=str, default=os.environ.get("ACCOUNTS_ARTIFACT"), help="Accounts JSON (local dir/file or gs://). If omitted, will try to load accounts_artifact.json next to checkpoint.")
+	parser.add_argument("--checkpoint", type=str, default="./out_small/model_state.pt", help="Path to model_state.pt or a directory (local or gs://)")
+	parser.add_argument("--runs-root", type=str, default=os.environ.get("OUTPUT_DIR", "./out_small"), help="Root directory or gs:// where run subdirectories are saved.")
+	parser.add_argument("--run-name", type=str, default=None, help="Which run subdirectory to use under runs-root.")
+	parser.add_argument("--use-latest-run", action="store_true", help="Automatically pick the most recently updated run under runs-root.")
+	parser.add_argument("--list-runs", action="store_true", help="List available runs under runs-root and exit.")
 	parser.add_argument("--encoder", type=str, default="prajjwal1/bert-tiny")
-	parser.add_argument("--hidden-dim", type=int, default=128)
+	parser.add_argument("--hidden-dim", type=int, default=512)
 	parser.add_argument("--max-length", type=int, default=64)
-	parser.add_argument("--max-lines", type=int, default=4)
+	parser.add_argument("--max-lines", type=int, default=40)
 	parser.add_argument("--beam-size", type=int, default=20)
 	parser.add_argument("--alpha", type=float, default=0.7)
 	parser.add_argument("--tau", type=float, default=0.2)
 	parser.add_argument("--currency", type=str, default="mxn", help="Optional currency string")
 	parser.add_argument("--je-type", type=str, default="general", help="Optional journal entry type")
-	parser.add_argument("--debug", action="store_true", default=True, help="Print debug shapes and logits")
+	parser.add_argument("--debug", action="store_true", default=False, help="Print debug shapes and logits")
 	parser.add_argument("--min-lines", type=int, default=1, help="Force at least this many lines via fallback if beam returns empty")
 	args = parser.parse_args()
 
 	device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu"))
+
+	# Optional: list runs and exit
+	if args.list_runs:
+		runs = list_runs(args.runs_root)
+		if not runs:
+			print("No runs found.")
+			return
+		for name, ts in runs:
+			print(f"{name}\t{ts}")
+		return
+
+	# Resolve checkpoint path/URI and base directory/URI
+	ckpt_uri = args.checkpoint
+	# If a run name is provided or latest-run requested, construct checkpoint from runs-root/run-name
+	if args.run_name or args.use_latest_run:
+		base_uri_sel = None
+		if args.run_name:
+			base_uri_sel = _uri_join(args.runs_root, args.run_name)
+		else:
+			runs = list_runs(args.runs_root)
+			if runs:
+				base_uri_sel = _uri_join(args.runs_root, runs[0][0])
+			else:
+				raise FileNotFoundError(f"No runs found under {args.runs_root}")
+		ckpt_uri = _uri_join(base_uri_sel, "model_state.pt")
+	if ckpt_uri.startswith("gs://"):
+		if ckpt_uri.endswith(".pt"):
+			pass
+		else:
+			ckpt_uri = _uri_join(ckpt_uri, "model_state.pt")
+		base_uri = _uri_dirname(ckpt_uri)
+	else:
+		if os.path.isdir(ckpt_uri):
+			ckpt_uri = os.path.join(ckpt_uri, "model_state.pt")
+		base_uri = os.path.dirname(ckpt_uri)
+
+	# Load config.json from alongside checkpoint if present and use to override core params
+	config_uri = _uri_join(base_uri, "config.json")
+	if _uri_exists(config_uri):
+		try:
+			cfg = load_json_from_uri(config_uri)
+			# Override core hyperparameters from training config
+			args.encoder = cfg.get("encoder", args.encoder)
+			args.hidden_dim = int(cfg.get("hidden_dim", args.hidden_dim))
+			args.max_lines = int(cfg.get("max_lines", args.max_lines))
+			args.max_length = int(cfg.get("max_length", args.max_length))
+			if args.debug:
+				print(f"[infer] Loaded config from {config_uri}")
+		except Exception as e:
+			if args.debug:
+				print(f"[infer] Failed to load config.json from {config_uri}: {e}")
 
 	# Tokenize description
 	tok = DescriptionTokenizer(model_name_or_path=args.encoder, max_length=args.max_length)
@@ -65,10 +210,17 @@ def main() -> None:
 	attention_mask = torch.tensor([batch["attention_mask"][0]], dtype=torch.long, device=device)
 
 	# Catalog embeddings
-	artifact = load_json_from_uri(args.accounts_artifact)
+	accounts_uri: Optional[str] = args.accounts_artifact
+	if not accounts_uri:
+		cand = _uri_join(base_uri, "accounts_artifact.json")
+		if _uri_exists(cand):
+			accounts_uri = cand
+		else:
+			raise FileNotFoundError("Accounts artifact not provided and accounts_artifact.json not found next to checkpoint.")
+	artifact = load_json_from_uri(accounts_uri)
 	cat_emb = build_catalog_embeddings(artifact, emb_dim=args.hidden_dim, device=device)
 	if args.debug:
-		print(f"[infer] catalog_embeddings shape={tuple(cat_emb.shape)} num_accounts={int(cat_emb.shape[0])}")
+		print(f"[infer] catalog_embeddings shape={tuple(cat_emb.shape)} num_accounts={int(cat_emb.shape[0])} from={accounts_uri}")
 
 	# Model
 	model = JEModel(
@@ -77,8 +229,8 @@ def main() -> None:
 		max_lines=args.max_lines,
 		temperature=1.0,
 	).to(device)
-	if args.checkpoint:
-		state = torch.load(args.checkpoint, map_location=device)
+	if ckpt_uri:
+		state = load_torch_from_uri(ckpt_uri, map_location=device)
 		state = state.get("model", state)
 		try:
 			model.load_state_dict(state, strict=True)

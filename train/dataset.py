@@ -49,7 +49,7 @@ class ParquetJEDataset(Dataset):
         max_lines: int = 8,
     ) -> None:
         self.files: List[str] = sorted(glob.glob(pattern)) if not pattern.startswith("gs://") else [pattern]
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_loc, use_fast=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_loc, use_fast=False)
         self.max_length = int(max_length)
         self.max_lines = int(max_lines)
         if not self.files:
