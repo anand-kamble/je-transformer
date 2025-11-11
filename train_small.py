@@ -4,10 +4,13 @@ import argparse
 import json
 import os
 import random
+import shutil
+import tempfile
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
+import wandb
 from dotenv import load_dotenv
 from torch.utils.data import DataLoader, Subset
 
@@ -107,10 +110,45 @@ def main() -> None:
     parser.add_argument("--flow-weight", type=float, default=0.05)
     parser.add_argument("--limit", type=int, default=200, help="Train on first N examples only")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--wandb-project", type=str, default="je-transformer", help="W&B project name")
+    parser.add_argument("--wandb-name", type=str, default=None, help="W&B run name (optional)")
+    parser.add_argument("--wandb-entity", type=str, default="liebre-ai", help="W&B entity/team name (optional)")
+    parser.add_argument("--no-wandb", action="store_true", help="Disable W&B tracking")
     args = parser.parse_args()
 
     if args.seed:
         set_seed(int(args.seed))
+
+    # Initialize wandb
+    wandb_enabled = not args.no_wandb
+    if wandb_enabled:
+        try:
+            wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_name,
+                entity=args.wandb_entity,
+                config={
+                    "encoder": args.encoder,
+                    "hidden_dim": args.hidden_dim,
+                    "max_lines": args.max_lines,
+                    "max_length": args.max_length,
+                    "batch_size": args.batch_size,
+                    "epochs": args.epochs,
+                    "lr": args.lr,
+                    "flow_weight": args.flow_weight,
+                    "limit": args.limit,
+                    "seed": args.seed,
+                },
+                job_type="training",
+            )
+            # Define custom metrics for better visualization
+            wandb.define_metric("step")
+            wandb.define_metric("train/*", step_metric="step")
+            wandb.define_metric("epoch")
+            wandb.define_metric("train/*", step_metric="epoch")
+        except Exception as e:
+            print(f"Warning: Failed to initialize wandb: {e}")
+            wandb_enabled = False
 
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu"))
 
@@ -278,12 +316,22 @@ def main() -> None:
     cat_emb = build_catalog_embeddings(artifact, emb_dim=args.hidden_dim, device=device)
 
     model = JEModel(encoder_loc=args.encoder, hidden_dim=args.hidden_dim, max_lines=args.max_lines, temperature=1.0).to(device)
+    
+    # Monitor model with wandb.watch() (always enabled when wandb is enabled)
+    if wandb_enabled:
+        try:
+            wandb.watch(model, log="gradients", log_freq=100)
+        except Exception as e:
+            print(f"Warning: Failed to enable wandb.watch(): {e}")
+    
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     metric_set_f1 = SetF1Metric()
 
     model.train()
     step = 0
     for epoch in range(args.epochs):
+        # Track last metrics from epoch for checkpoint
+        last_metrics = None
         for features, targets in dl:
             step += 1
             input_ids = features["input_ids"].to(device)
@@ -328,6 +376,17 @@ def main() -> None:
             ) * float(args.flow_weight)
             total = pl + sl + stl + cov + flow
             optimizer.step()
+            
+            # Store last metrics for checkpoint
+            last_metrics = {
+                "loss": total.item(),
+                "pointer_loss": pl.item(),
+                "side_loss": sl.item(),
+                "stop_loss": stl.item(),
+                "coverage_penalty": cov.item(),
+                "flow_loss": flow.item(),
+                "set_f1": metric_set_f1.result().item() if step % 20 == 0 else (last_metrics["set_f1"] if last_metrics else 0.0),
+            }
 
             if step % 20 == 0:
                 metric_set_f1.update_state(
@@ -340,6 +399,127 @@ def main() -> None:
                 print(
                     f"step {step} loss={total.item():.4f} ptr={pl.item():.4f} side={sl.item():.4f} stop={stl.item():.4f} cov={cov.item():.4f} flow={flow.item():.4f} setF1={metric_set_f1.result().item():.4f}"
                 )
+                # Log metrics to wandb
+                if wandb_enabled:
+                    try:
+                        wandb.log({
+                            "step": step,
+                            "epoch": epoch,
+                            "train/loss": total.item(),
+                            "train/pointer_loss": pl.item(),
+                            "train/side_loss": sl.item(),
+                            "train/stop_loss": stl.item(),
+                            "train/coverage_penalty": cov.item(),
+                            "train/flow_loss": flow.item(),
+                            "train/set_f1": metric_set_f1.result().item(),
+                            "train/learning_rate": args.lr,
+                        })
+                    except Exception as e:
+                        print(f"Warning: Failed to log to wandb: {e}")
+        
+        # Save comprehensive epoch checkpoint
+        # Use last metrics from epoch, or default if none available
+        if last_metrics is None:
+            # Fallback if no metrics were recorded
+            last_metrics = {
+                "loss": 0.0,
+                "pointer_loss": 0.0,
+                "side_loss": 0.0,
+                "stop_loss": 0.0,
+                "coverage_penalty": 0.0,
+                "flow_loss": 0.0,
+                "set_f1": metric_set_f1.result().item() if hasattr(metric_set_f1, 'result') else 0.0,
+            }
+        current_metrics = last_metrics
+        
+        # Create temporary directory for checkpoint files
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 1. Save PyTorch checkpoint
+            ckpt_path = os.path.join(tmpdir, f"checkpoint_epoch_{epoch+1}.pt")
+            torch.save({
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": None,  # No scheduler in train_small
+                "epoch": epoch + 1,
+                "step": step,
+                "metrics": current_metrics,
+            }, ckpt_path)
+            
+            # 2. Save model config
+            config_path = os.path.join(tmpdir, "config.json")
+            with open(config_path, "w") as f:
+                json.dump({
+                    "encoder": args.encoder,
+                    "hidden_dim": args.hidden_dim,
+                    "max_lines": args.max_lines,
+                    "max_length": args.max_length,
+                    "temperature": 1.0,  # Model default
+                }, f, indent=2)
+            
+            # 3. Save accounts artifact (copy from source)
+            accounts_path = os.path.join(tmpdir, "accounts_artifact.json")
+            artifact_data = load_json_from_uri(accounts_artifact_path)
+            with open(accounts_path, "w", encoding="utf-8") as f:
+                json.dump(artifact_data, f, indent=2, ensure_ascii=False)
+            
+            # 4. Save training metadata
+            metadata_path = os.path.join(tmpdir, "training_metadata.json")
+            with open(metadata_path, "w") as f:
+                json.dump({
+                    "epoch": epoch + 1,
+                    "step": step,
+                    "total_steps": len(dl) * (epoch + 1),
+                    "hyperparameters": {
+                        "encoder": args.encoder,
+                        "hidden_dim": args.hidden_dim,
+                        "max_lines": args.max_lines,
+                        "max_length": args.max_length,
+                        "batch_size": args.batch_size,
+                        "epochs": args.epochs,
+                        "lr": args.lr,
+                        "flow_weight": args.flow_weight,
+                        "limit": args.limit,
+                        "seed": args.seed,
+                    },
+                    "metrics": current_metrics,
+                }, f, indent=2)
+            
+            # 5. Create wandb artifact
+            if wandb_enabled:
+                try:
+                    artifact = wandb.Artifact(
+                        name=f"model-epoch-{epoch+1}",
+                        type="model",
+                        metadata={
+                            "epoch": epoch + 1,
+                            "step": step,
+                            "set_f1": current_metrics["set_f1"],
+                            "loss": current_metrics["loss"],
+                        }
+                    )
+                    artifact.add_file(ckpt_path, name="checkpoint.pt")
+                    artifact.add_file(config_path, name="config.json")
+                    artifact.add_file(accounts_path, name="accounts_artifact.json")
+                    artifact.add_file(metadata_path, name="training_metadata.json")
+                    wandb.log_artifact(artifact)
+                except Exception as e:
+                    print(f"Warning: Failed to log wandb artifact: {e}")
+            
+            # 6. Also save to local/gs:// for backward compatibility
+            os.makedirs(args.output_dir, exist_ok=True) if not args.output_dir.startswith("gs://") else None
+            local_ckpt_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}.pt") if not args.output_dir.startswith("gs://") else f"/tmp/checkpoint_epoch_{epoch+1}.pt"
+            
+            # Copy checkpoint to final location
+            shutil.copy2(ckpt_path, local_ckpt_path)
+            
+            if args.output_dir.startswith("gs://"):
+                from google.cloud import storage
+
+                client = storage.Client()
+                _, path = args.output_dir.split("gs://", 1)
+                bucket_name, prefix = path.split("/", 1)
+                blob = client.bucket(bucket_name).blob(f"{prefix.rstrip('/')}/checkpoint_epoch_{epoch+1}.pt")
+                blob.upload_from_filename(local_ckpt_path)
 
     # Save final checkpoint
     if args.output_dir.startswith("gs://"):
@@ -358,6 +538,18 @@ def main() -> None:
         ckpt = os.path.join(args.output_dir, "model_state.pt")
         torch.save({"model": model.state_dict()}, ckpt)
         print(f"Checkpoint written to {ckpt}")
+    
+    # Log final summary to wandb
+    if wandb_enabled:
+        try:
+            wandb.summary.update({
+                "final_epoch": args.epochs,
+                "final_step": step,
+                "final_set_f1": metric_set_f1.result().item(),
+            })
+            wandb.finish()
+        except Exception as e:
+            print(f"Warning: Failed to update wandb summary: {e}")
 
 
 if __name__ == "__main__":

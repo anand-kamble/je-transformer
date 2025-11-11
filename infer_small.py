@@ -143,6 +143,7 @@ def main() -> None:
 		print(f"[infer] beam candidates returned={len(cands) if cands else 0}")
 	# Fallback: if beam returns empty or length 0 and min-lines requested, force 1 line greedily
 	if (not cands or (cands and cands[0].get("length", 0) == 0)) and int(args.min_lines) > 0:
+		print(f"[infer] fallback to min-lines={args.min_lines}")
 		with torch.no_grad():
 			prev_acc0 = torch.full((1, args.max_lines), -1, dtype=torch.long, device=device)
 			prev_side0 = torch.full((1, args.max_lines), -1, dtype=torch.long, device=device)
