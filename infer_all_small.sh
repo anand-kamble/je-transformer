@@ -31,6 +31,21 @@ if [[ -z "${cmd}" ]]; then
 fi
 
 if [[ "${cmd}" == "--list" ]]; then
+  shift 1
+  # Allow optional overrides like --runs-root even with --list
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --runs-root)
+        shift
+        RUNS_ROOT="${1:-${RUNS_ROOT}}"
+        shift
+        ;;
+      *)
+        echo "Unknown arg: $1"
+        exit 1
+        ;;
+    esac
+  done
   "${PYTHON_BIN}" "${ROOT}/infer_small.py" \
     --runs-root "${RUNS_ROOT}" \
     --list-runs
@@ -45,6 +60,52 @@ else
   RUN_NAME="${cmd}"
 fi
 
+# Parse optional flags after the first arg
+shift 1 || true
+DESC_OPT=""
+DATE_OPT=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --description)
+      shift
+      DESC_OPT="${1:-}"
+      shift
+      ;;
+    --date)
+      shift
+      DATE_OPT="${1:-}"
+      shift
+      ;;
+    --runs-root)
+      shift
+      RUNS_ROOT="${1:-${RUNS_ROOT}}"
+      shift
+      ;;
+    --beam-size|--alpha|--tau|--min-lines)
+      # Capture known numeric overrides here to pass through later via env or args
+      key="${1#--}"
+      shift
+      val="${1:-}"
+      case "${key}" in
+        beam-size) BEAM_SIZE="${val}" ;;
+        alpha) ALPHA="${val}" ;;
+        tau) TAU="${val}" ;;
+        min-lines) MIN_LINES="${val}" ;;
+      esac
+      shift
+      ;;
+    --debug)
+      DEBUG=1
+      shift
+      ;;
+    *)
+      echo "Unknown arg: $1"
+      exit 1
+      ;;
+  esac
+done
+
+# Build python args
 args=( "${ROOT}/infer_small.py" "--runs-root" "${RUNS_ROOT}" )
 if [[ "${USE_LATEST}" -eq 1 ]]; then
   args+=( "--use-latest-run" )
@@ -53,8 +114,13 @@ else
 fi
 
 # Optional overrides
-if [[ -n "${DESCRIPTION:-}" ]]; then
+if [[ -n "${DESC_OPT}" ]]; then
+  args+=( "--description" "${DESC_OPT}" )
+elif [[ -n "${DESCRIPTION:-}" ]]; then
   args+=( "--description" "${DESCRIPTION}" )
+fi
+if [[ -n "${DATE_OPT}" ]]; then
+  args+=( "--date" "${DATE_OPT}" )
 fi
 if [[ -n "${BEAM_SIZE:-}" ]]; then
   args+=( "--beam-size" "${BEAM_SIZE}" )
