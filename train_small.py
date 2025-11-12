@@ -248,9 +248,8 @@ def main() -> None:
 
             # Define custom metrics for better visualization
             wandb.define_metric("step")
-            wandb.define_metric("train/*", step_metric="step")
             wandb.define_metric("epoch")
-            wandb.define_metric("train/*", step_metric="epoch")
+            wandb.define_metric("train/*", step_metric="step")
             wandb.define_metric("val/*", step_metric="epoch")
             wandb.define_metric("retrieval/*", step_metric="epoch")
         except Exception as e:
@@ -724,6 +723,15 @@ def main() -> None:
             optimizer.step()
             scheduler.step()
             
+            # Update SetF1 every step (windowed); will be logged and reset periodically
+            metric_set_f1.update_state(
+                outputs["pointer_logits"].detach().cpu(),
+                outputs["side_logits"].detach().cpu(),
+                target_account_idx.detach().cpu(),
+                target_side_id.detach().cpu(),
+                target_stop_id.detach().cpu(),
+            )
+            
             # Store last metrics for checkpoint
             last_metrics = {
                 "loss": total.item(),
@@ -732,7 +740,7 @@ def main() -> None:
                 "stop_loss": stl.item(),
                 "coverage_penalty": cov.item(),
                 "flow_loss": flow.item(),
-                "set_f1": metric_set_f1.result().item() if step % 20 == 0 else (last_metrics["set_f1"] if last_metrics else 0.0),
+                "set_f1": metric_set_f1.result().item() if step % 100 == 0 else (last_metrics["set_f1"] if last_metrics else 0.0),
             }
 
 
@@ -745,13 +753,6 @@ def main() -> None:
                     p_std = float(p_logits.std().item())
                 except Exception:
                     p_max = p_min = p_std = 0.0
-                metric_set_f1.update_state(
-                    outputs["pointer_logits"].detach().cpu(),
-                    outputs["side_logits"].detach().cpu(),
-                    target_account_idx.detach().cpu(),
-                    target_side_id.detach().cpu(),
-                    target_stop_id.detach().cpu(),
-                )
                 
                 # True learning rates (after scheduler.step())
                 lr_groups = scheduler.get_last_lr()  # list per param group
@@ -784,7 +785,6 @@ def main() -> None:
                             "train/coverage_penalty": cov.item(),
                             "train/flow_loss": flow.item(),
                             "train/set_f1": metric_set_f1.result().item(),
-                            "train/learning_rate": args.lr,
                             "train/pointer_logit_max": p_max,
                             "train/pointer_logit_min": p_min,
                             "train/pointer_logit_std": p_std,
@@ -793,6 +793,10 @@ def main() -> None:
                         })
                     except Exception as e:
                         print(f"Warning: Failed to log to wandb: {e}")
+                # Reset windowed SetF1 after logging to keep metric recent
+                _reset = getattr(metric_set_f1, "reset", None)
+                if callable(_reset):
+                    _reset()
         
         # End-of-epoch validation
         if dl_val is not None:
@@ -804,6 +808,9 @@ def main() -> None:
             val_stl = 0.0
             val_cov = 0.0
             val_flow = 0.0
+            val_pl_ce_raw = 0.0
+            val_sl_ce_raw = 0.0
+            val_stl_ce_raw = 0.0
             val_metric = SetF1Metric()
             # Retrieval metrics aggregation buffers
             retr_query_ids: List[str] = []
@@ -862,6 +869,9 @@ def main() -> None:
                     )
                     # Apply same weights as training (no extra normalization)
                     loss_weights_v = get_loss_weights(epoch, args.epochs)
+                    pl_ce_raw_v = masked_sparse_ce(outs_v["pointer_logits"], tgt_acc_v, ignore_index=-1)
+                    sl_ce_raw_v = masked_sparse_ce(outs_v["side_logits"], tgt_side_v, ignore_index=-1)
+                    stl_ce_raw_v = masked_sparse_ce(outs_v["stop_logits"], tgt_stop_v, ignore_index=-1)
                     total_v = (
                         pl_v
                         + sl_v
@@ -875,6 +885,9 @@ def main() -> None:
                     val_stl += float(stl_v.item())
                     val_cov += float(cov_v.item())
                     val_flow += float(flow_v.item())
+                    val_pl_ce_raw += float(pl_ce_raw_v.item())
+                    val_sl_ce_raw += float(sl_ce_raw_v.item())
+                    val_stl_ce_raw += float(stl_ce_raw_v.item())
                     val_metric.update_state(
                         outs_v["pointer_logits"].detach().cpu(),
                         outs_v["side_logits"].detach().cpu(),
@@ -933,6 +946,9 @@ def main() -> None:
                 "val/coverage_penalty": val_cov / den,
                 "val/flow_loss": val_flow / den,
                 "val/set_f1": float(val_metric.result().item()) if hasattr(val_metric, "result") else 0.0,
+                "val/pointer_ce_raw": val_pl_ce_raw / den,
+                "val/side_ce_raw": val_sl_ce_raw / den,
+                "val/stop_ce_raw": val_stl_ce_raw / den,
             }
             if wandb_enabled:
                 try:
