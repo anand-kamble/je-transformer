@@ -797,7 +797,7 @@ def main() -> None:
                                     cap = f"neighbors: {', '.join(nids[:5])}"
                                 images.append(wandb.Image(img, caption=cap))
                             if images and wandb_enabled:
-                                wandb.log({f"retrieval/heatmaps": images, "epoch": epoch})
+                                wandb.log({"retrieval/heatmaps": images})
                             first_heatmaps_logged = True
                         except Exception as _img_e:
                             print(f"[wandb] Warning: failed logging retrieval heatmaps: {_img_e}")
