@@ -615,8 +615,6 @@ def main() -> None:
     best_loss = float("inf")
     best_epoch = 0
     best_metrics: Optional[Dict[str, float]] = None
-    # Running EMA scales for balanced multi-task loss
-    loss_stds = {"pl": 1.0, "sl": 1.0, "stl": 1.0}
     for epoch in range(args.epochs):
         # Track last metrics from epoch for checkpoint
         last_metrics = None
@@ -666,23 +664,9 @@ def main() -> None:
             sl = side_loss(outputs["side_logits"], target_side_id, ignore_index=-1)
             stl = stop_loss(outputs["stop_logits"], target_stop_id, ignore_index=-1)
 
-
-            # Update running std (EMA) and normalize primary losses
-            try:
-                loss_stds["pl"] = 0.99 * loss_stds["pl"] + 0.01 * float(pl.detach().item())
-                loss_stds["sl"] = 0.99 * loss_stds["sl"] + 0.01 * float(sl.detach().item())
-                loss_stds["stl"] = 0.99 * loss_stds["stl"] + 0.01 * float(stl.detach().item())
-            except Exception:
-                # Fallback: keep previous scales if any issue occurs
-                pass
-            pl_normalized = pl / max(0.1, float(loss_stds["pl"]))
-            sl_normalized = sl / max(0.1, float(loss_stds["sl"]))
-            stl_normalized = stl / max(0.1, float(loss_stds["stl"]))
-
             # These use the pre-computed probabilities
-            cov = coverage_penalty(outputs["pointer_logits"], probs=pointer_probs) * 0.01     # Modify function
-            # Flow loss with warmup schedule
-            flow_weight_now = float(args.flow_weight) * (float(args.flow_warmup_multiplier) if epoch < int(args.flow_warmup_epochs) else 1.0)
+            cov = coverage_penalty(outputs["pointer_logits"], probs=pointer_probs)
+            # Raw flow auxiliary loss (weights applied via get_loss_weights)
             flow = flow_aux_loss(
                 outputs["pointer_logits"],
                 outputs["side_logits"],
@@ -692,14 +676,14 @@ def main() -> None:
                 credit_weights,
                 pointer_probs=pointer_probs,
                 side_probs=side_probs,
-            ) * flow_weight_now
+            )
 
             loss_weights = get_loss_weights(epoch, args.epochs)
             # Balanced multi-task loss: normalized primary components + scheduled aux terms
             total = (
-                pl_normalized
-                + sl_normalized
-                + stl_normalized
+                pl
+                + sl
+                + stl
                 + cov * loss_weights['coverage']
                 + flow * loss_weights['flow']
             )
@@ -772,7 +756,8 @@ def main() -> None:
                             "train/pointer_logit_max": p_max,
                             "train/pointer_logit_min": p_min,
                             "train/pointer_logit_std": p_std,
-                            "train/flow_weight_now": flow_weight_now,
+                            "train/flow_weight_now": loss_weights.get("flow", float(args.flow_weight)),
+                            "train/coverage_weight_now": loss_weights.get("coverage", 0.01),
                         })
                     except Exception as e:
                         print(f"Warning: Failed to log to wandb: {e}")
@@ -832,8 +817,7 @@ def main() -> None:
                     pl_v = pointer_loss(outs_v["pointer_logits"], tgt_acc_v, ignore_index=-1)
                     sl_v = side_loss(outs_v["side_logits"], tgt_side_v, ignore_index=-1)
                     stl_v = stop_loss(outs_v["stop_logits"], tgt_stop_v, ignore_index=-1)
-                    cov_v = coverage_penalty(outs_v["pointer_logits"], probs=pp_v) * 0.01
-                    flow_w_now = float(args.flow_weight) * (float(args.flow_warmup_multiplier) if epoch < int(args.flow_warmup_epochs) else 1.0)
+                    cov_v = coverage_penalty(outs_v["pointer_logits"], probs=pp_v)
                     flow_v = flow_aux_loss(
                         outs_v["pointer_logits"],
                         outs_v["side_logits"],
@@ -843,12 +827,16 @@ def main() -> None:
                         cre_w_v,
                         pointer_probs=pp_v,
                         side_probs=sp_v,
-                    ) * flow_w_now
-                    # Apply same normalization as training (do not update EMA during validation)
-                    pl_v_norm = pl_v / max(0.1, float(loss_stds["pl"]))
-                    sl_v_norm = sl_v / max(0.1, float(loss_stds["sl"]))
-                    stl_v_norm = stl_v / max(0.1, float(loss_stds["stl"]))
-                    total_v = pl_v_norm + sl_v_norm + stl_v_norm + cov_v + flow_v
+                    )
+                    # Apply same weights as training (no extra normalization)
+                    loss_weights_v = get_loss_weights(epoch, args.epochs)
+                    total_v = (
+                        pl_v
+                        + sl_v
+                        + stl_v
+                        + cov_v * loss_weights_v['coverage']
+                        + flow_v * loss_weights_v['flow']
+                    )
                     val_total += float(total_v.item())
                     val_pl += float(pl_v.item())
                     val_sl += float(sl_v.item())

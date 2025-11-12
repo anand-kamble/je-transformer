@@ -19,4 +19,5 @@ dependencies = [
     "psycopg2-binary>=2.9.11",
     "sqlalchemy>=2.0.44",
     "wandb>=0.16.0",
+    "ipykernel>=7.1.0",
 ]

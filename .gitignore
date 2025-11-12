@@ -14,3 +14,6 @@ wheels/
 out_small/
 out_small_ingest/
 test-run-outputs/
+run_local.sh
+gcs_secret.json
+_for_me.py
