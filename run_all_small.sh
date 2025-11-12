@@ -14,11 +14,17 @@ BATCH_SIZE="${BATCH_SIZE:-64}"
 FINAL_EPOCHS="${EPOCHS:-30}"
 LR="${LR:-1e-4}"
 LIMIT="${LIMIT:-5000}"
-POINTER_TEMP="${POINTER_TEMP:-0.05}"
-POINTER_SCALE_INIT="${POINTER_SCALE_INIT:-20.0}"
-FLOW_WARMUP_EPOCHS="${FLOW_WARMUP_EPOCHS:-10}"
-FLOW_WARMUP_MULT="${FLOW_WARMUP_MULT:-10.0}"
+POINTER_TEMP="${POINTER_TEMP:-0.5}"
+POINTER_SCALE_INIT="${POINTER_SCALE_INIT:-5.0}"
+FLOW_WARMUP_EPOCHS="${FLOW_WARMUP_EPOCHS:-3}"
+FLOW_WARMUP_MULT="${FLOW_WARMUP_MULT:-5.0}"
 TOP_K="${TOP_K:-5}"
+VAL_RATIO="${VAL_RATIO:-0.1}"
+MAX_VAL_BATCHES="${MAX_VAL_BATCHES:-0}"
+LOG_RETRIEVAL_HEATMAPS="${LOG_RETRIEVAL_HEATMAPS:-1}"
+EVAL_SAMPLES="${EVAL_SAMPLES:-4}"
+LR_WARMUP_EPOCHS="${LR_WARMUP_EPOCHS:-2}"
+MAX_GRAD_NORM="${MAX_GRAD_NORM:-0.5}"
 
 # GCS locations (prefixes)
 GCS_INGEST_PREFIX="${GCS_INGEST_PREFIX:-gs://dev-rai-files/je-ingest}"
@@ -108,11 +114,17 @@ echo "[3/3] Training model with retrieval ..."
   --batch-size "${BATCH_SIZE}" \
   --epochs "${FINAL_EPOCHS}" \
   --lr "${LR}" \
+  --lr-warmup-epochs "${LR_WARMUP_EPOCHS}" \
+  --max-grad-norm "${MAX_GRAD_NORM}" \
   --output-dir "${OUTPUTS_DIR}" \
   --wandb-name "${RUN_NAME}" \
   --parquet-pattern "${PARQUET_PATTERN}" \
   --accounts-artifact "${ACCOUNTS_URI}" \
   --limit "${LIMIT}" \
+  --val-ratio "${VAL_RATIO}" \
+  --max-val-batches "${MAX_VAL_BATCHES}" \
+  $( [[ "${LOG_RETRIEVAL_HEATMAPS}" != "0" ]] && echo "--log-retrieval-heatmaps" ) \
+  --eval-samples "${EVAL_SAMPLES}" \
   --pointer-temp "${POINTER_TEMP}" \
   --pointer-scale-init "${POINTER_SCALE_INIT}" \
   --learnable-pointer-scale \

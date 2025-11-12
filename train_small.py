@@ -15,6 +15,7 @@ import torch
 import wandb
 from dotenv import load_dotenv
 from torch.utils.data import DataLoader, Subset
+from transformers import get_cosine_schedule_with_warmup
 
 
 # Ingestion is now handled by data/ingest_to_parquet.py (external step)
@@ -112,17 +113,20 @@ def main() -> None:
     parser.add_argument("--hidden-dim", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--flow-weight", type=float, default=0.05)
     # Pointer/logit scaling and catalog options
-    parser.add_argument("--pointer-temp", type=float, default=0.1, help="Pointer softmax temperature (smaller -> larger logits)")
-    parser.add_argument("--pointer-scale-init", type=float, default=10.0, help="Initial multiplicative scale for pointer logits")
+    parser.add_argument("--pointer-temp", type=float, default=0.5, help="Pointer softmax temperature (larger -> softer distribution)")
+    parser.add_argument("--pointer-scale-init", type=float, default=5.0, help="Initial multiplicative scale for pointer logits")
     parser.add_argument("--learnable-pointer-scale", action="store_true", help="Make pointer logit scale learnable")
     parser.add_argument("--no-pointer-norm", action="store_true", help="Disable L2 normalization in pointer layer")
     parser.add_argument("--trainable-catalog", action="store_true", help="Make catalog embeddings trainable inside model")
     # Flow warmup
     parser.add_argument("--flow-warmup-epochs", type=int, default=3, help="Epochs to apply warmup multiplier to flow loss")
     parser.add_argument("--flow-warmup-multiplier", type=float, default=5.0, help="Multiplier for flow loss during warmup")
+    # Optimizer stability
+    parser.add_argument("--max-grad-norm", type=float, default=0.5, help="Gradient clipping max norm")
+    parser.add_argument("--lr-warmup-epochs", type=int, default=2, help="Epochs for LR warmup in cosine schedule")
     # Optional retrieval memory integration
     parser.add_argument("--retrieval-index-dir", type=str, default=os.environ.get("RETRIEVAL_INDEX_DIR"), help="ScaNN index dir (gs://). Enables retrieval when provided")
     parser.add_argument("--retrieval-top-k", type=int, default=int(os.environ.get("RETRIEVAL_TOP_K", "5")))
@@ -456,6 +460,7 @@ def main() -> None:
             # Locate embeddings under the index dir (manifest → embeddings.npy → dataset.npy)
             emb_np = None
             candidates: List[str] = []
+            ids_rel = None
             if manifest and isinstance(manifest.get("files", {}), dict):
                 emb_rel = manifest["files"].get("embeddings")
                 ids_rel = manifest["files"].get("ids")
@@ -551,6 +556,10 @@ def main() -> None:
             print(f"Warning: Failed to enable wandb.watch(): {e}")
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    # Scheduler with warmup over epochs
+    total_steps = max(1, len(dl) * int(args.epochs))
+    warmup_steps = int(max(0, int(args.lr_warmup_epochs)) * len(dl))
+    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
     metric_set_f1 = SetF1Metric()
 
 
@@ -626,9 +635,26 @@ def main() -> None:
 
 
             total = pl + sl + stl + cov + flow
+            # NaN/Inf guards
+            def _finite(x: torch.Tensor) -> bool:
+                try:
+                    return bool(torch.isfinite(x).all())
+                except Exception:
+                    return True
+            all_finite = _finite(total) and _finite(pl) and _finite(sl) and _finite(stl) and _finite(cov) and _finite(flow)
+            if not all_finite:
+                print("[anomaly] Non-finite loss component detected; skipping optimizer step.")
+                if wandb_enabled:
+                    try:
+                        wandb.log({"anomaly/non_finite_loss": 1, "epoch": epoch, "step": step})
+                    except Exception:
+                        pass
+                optimizer.zero_grad(set_to_none=True)
+                continue
             total.backward()  # No retain_graph needed!
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(args.max_grad_norm))
             optimizer.step()
+            scheduler.step()
             
             # Store last metrics for checkpoint
             last_metrics = {
