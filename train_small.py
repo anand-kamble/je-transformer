@@ -615,6 +615,8 @@ def main() -> None:
     best_loss = float("inf")
     best_epoch = 0
     best_metrics: Optional[Dict[str, float]] = None
+    # Running EMA scales for balanced multi-task loss
+    loss_stds = {"pl": 1.0, "sl": 1.0, "stl": 1.0}
     for epoch in range(args.epochs):
         # Track last metrics from epoch for checkpoint
         last_metrics = None
@@ -665,6 +667,18 @@ def main() -> None:
             stl = stop_loss(outputs["stop_logits"], target_stop_id, ignore_index=-1)
 
 
+            # Update running std (EMA) and normalize primary losses
+            try:
+                loss_stds["pl"] = 0.99 * loss_stds["pl"] + 0.01 * float(pl.detach().item())
+                loss_stds["sl"] = 0.99 * loss_stds["sl"] + 0.01 * float(sl.detach().item())
+                loss_stds["stl"] = 0.99 * loss_stds["stl"] + 0.01 * float(stl.detach().item())
+            except Exception:
+                # Fallback: keep previous scales if any issue occurs
+                pass
+            pl_normalized = pl / max(0.1, float(loss_stds["pl"]))
+            sl_normalized = sl / max(0.1, float(loss_stds["sl"]))
+            stl_normalized = stl / max(0.1, float(loss_stds["stl"]))
+
             # These use the pre-computed probabilities
             cov = coverage_penalty(outputs["pointer_logits"], probs=pointer_probs) * 0.01     # Modify function
             # Flow loss with warmup schedule
@@ -681,7 +695,14 @@ def main() -> None:
             ) * flow_weight_now
 
             loss_weights = get_loss_weights(epoch, args.epochs)
-            total = pl + sl + stl + cov * loss_weights['coverage'] + flow * loss_weights['flow']
+            # Balanced multi-task loss: normalized primary components + scheduled aux terms
+            total = (
+                pl_normalized
+                + sl_normalized
+                + stl_normalized
+                + cov * loss_weights['coverage']
+                + flow * loss_weights['flow']
+            )
             # NaN/Inf guards
             def _finite(x: torch.Tensor) -> bool:
                 try:
@@ -823,7 +844,11 @@ def main() -> None:
                         pointer_probs=pp_v,
                         side_probs=sp_v,
                     ) * flow_w_now
-                    total_v = pl_v + sl_v + stl_v + cov_v + flow_v
+                    # Apply same normalization as training (do not update EMA during validation)
+                    pl_v_norm = pl_v / max(0.1, float(loss_stds["pl"]))
+                    sl_v_norm = sl_v / max(0.1, float(loss_stds["sl"]))
+                    stl_v_norm = stl_v / max(0.1, float(loss_stds["stl"]))
+                    total_v = pl_v_norm + sl_v_norm + stl_v_norm + cov_v + flow_v
                     val_total += float(total_v.item())
                     val_pl += float(pl_v.item())
                     val_sl += float(sl_v.item())

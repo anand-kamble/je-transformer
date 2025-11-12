@@ -29,6 +29,31 @@ def masked_sparse_ce(logits: torch.Tensor, targets: torch.Tensor, ignore_index: 
     denom = torch.clamp(mask.sum(), min=1.0)
     return ce.sum() / denom
 
+def adaptive_loss_scale(loss: torch.Tensor, momentum: float = 0.99) -> torch.Tensor:
+    """
+    Normalize loss by its running standard deviation to reduce variance.
+    Based on research showing variance regularization improves stability.
+    """
+    if not hasattr(adaptive_loss_scale, 'running_mean'):
+        adaptive_loss_scale.running_mean = 0.0
+        adaptive_loss_scale.running_var = 1.0
+    
+    # Update running statistics
+    loss_val = loss.detach().item()
+    adaptive_loss_scale.running_mean = (
+        momentum * adaptive_loss_scale.running_mean + (1 - momentum) * loss_val
+    )
+    adaptive_loss_scale.running_var = (
+        momentum * adaptive_loss_scale.running_var + 
+        (1 - momentum) * (loss_val - adaptive_loss_scale.running_mean) ** 2
+    )
+    
+    # Normalize by running std (with floor to prevent division by zero)
+    running_std = torch.sqrt(torch.tensor(adaptive_loss_scale.running_var + 1e-6))
+    normalized_loss = loss / torch.clamp(running_std, min=0.5, max=5.0)
+    
+    return normalized_loss
+
 
 def pointer_loss(pointer_logits: torch.Tensor, target_account_idx: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
     """
@@ -39,23 +64,15 @@ def pointer_loss(pointer_logits: torch.Tensor, target_account_idx: torch.Tensor,
     
     # Add batch-wise variance normalization to stabilize training
     # This reduces the high variance visible in training graphs
-    if loss.requires_grad:
-        # Detach to prevent gradients flowing through normalization statistics
-        loss_magnitude = loss.detach()
-        
-        # Normalize by a moving average or current batch statistics
-        # Clamp to prevent division by very small values
-        normalizer = torch.clamp(loss_magnitude, min=0.1, max=10.0)
-        loss = loss / normalizer
-    
-    return loss
+    return adaptive_loss_scale(loss)
+
 
 def side_loss(side_logits: torch.Tensor, target_side_id: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
-    return masked_sparse_ce(side_logits, target_side_id, ignore_index=ignore_index)
+    return adaptive_loss_scale(masked_sparse_ce(side_logits, target_side_id, ignore_index=ignore_index))
 
 
 def stop_loss(stop_logits: torch.Tensor, target_stop_id: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
-    return masked_sparse_ce(stop_logits, target_stop_id, ignore_index=ignore_index)
+    return adaptive_loss_scale(masked_sparse_ce(stop_logits, target_stop_id, ignore_index=ignore_index))
 
 
 def coverage_penalty(pointer_logits: torch.Tensor, max_total: float = 1.0, probs: Optional[torch.Tensor] = None) -> torch.Tensor:
