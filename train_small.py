@@ -114,7 +114,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--flow-weight", type=float, default=0.05)
+    parser.add_argument("--flow-weight", type=float, default=0.01)
     # Pointer/logit scaling and catalog options
     parser.add_argument("--pointer-temp", type=float, default=0.5, help="Pointer softmax temperature (larger -> softer distribution)")
     parser.add_argument("--pointer-scale-init", type=float, default=5.0, help="Initial multiplicative scale for pointer logits")
@@ -184,6 +184,28 @@ def main() -> None:
             os.makedirs(args.gcs_output_uri, exist_ok=True)
         else:
             args.gcs_output_uri = f"{args.gcs_output_uri.rstrip('/')}/{run_name}"
+            
+    def get_loss_weights(epoch, total_epochs):
+        """Progressive loss weighting schedule"""
+        progress = epoch / total_epochs
+        
+        # Reduce flow loss weight over time (starts high for structure)
+        flow_weight = args.flow_weight * (2.0 - progress)
+        
+        # Increase coverage weight over time (for refinement)
+        coverage_weight = 0.01 * (1.0 + progress)
+        
+        # Warmup stops after epoch 3
+        if epoch < 3:
+            flow_warmup = args.flow_warmup_multiplier
+        else:
+            flow_warmup = 1.0
+        
+        return {
+            'flow': flow_weight * flow_warmup,
+            'coverage': coverage_weight,
+        }
+
 
     # Initialize wandb with the pre-generated run name/ID
     if wandb_enabled:
@@ -542,6 +564,22 @@ def main() -> None:
             mem = torch.stack(mem_list, dim=0).to(device)  # [B, K, H]
             return nbrs, mem
         return None
+    def clip_grad_by_component(model, max_norm):
+        """Clip gradients for pointer, side, stop heads separately"""
+        param_groups = {
+            'pointer': [p for n, p in model.named_parameters() 
+                    if 'pointer' in n and p.grad is not None],
+            'side': [p for n, p in model.named_parameters() 
+                    if 'side' in n and p.grad is not None],
+            'stop': [p for n, p in model.named_parameters() 
+                    if 'stop' in n and p.grad is not None],
+            'encoder': [p for n, p in model.named_parameters() 
+                    if 'encoder' in n and p.grad is not None],
+        }
+        
+        for name, params in param_groups.items():
+            if params:
+                torch.nn.utils.clip_grad_norm_(params, max_norm)
     if args.trainable_catalog:
         try:
             model.set_catalog_embeddings(cat_emb)
@@ -554,11 +592,20 @@ def main() -> None:
             wandb.watch(model, log="gradients", log_freq=100)
         except Exception as e:
             print(f"Warning: Failed to enable wandb.watch(): {e}")
+            
+    pointer_params = [p for n, p in model.named_parameters() if 'pointer' in n]
+    other_params = [p for n, p in model.named_parameters() if 'pointer' not in n]
+
+
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW([
+        {'params': other_params, 'lr': args.lr},
+        {'params': pointer_params, 'lr': args.lr * 0.5}  # Lower LR for pointer
+    ], lr=args.lr)
+
     # Scheduler with warmup over epochs
     total_steps = max(1, len(dl) * int(args.epochs))
-    warmup_steps = int(max(0, int(args.lr_warmup_epochs)) * len(dl))
+    warmup_steps = int(0.1 * total_steps)  
     scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
     metric_set_f1 = SetF1Metric()
 
@@ -633,8 +680,8 @@ def main() -> None:
                 side_probs=side_probs,
             ) * flow_weight_now
 
-
-            total = pl + sl + stl + cov + flow
+            loss_weights = get_loss_weights(epoch, args.epochs)
+            total = pl + sl + stl + cov * loss_weights['coverage'] + flow * loss_weights['flow']
             # NaN/Inf guards
             def _finite(x: torch.Tensor) -> bool:
                 try:
@@ -652,7 +699,7 @@ def main() -> None:
                 optimizer.zero_grad(set_to_none=True)
                 continue
             total.backward()  # No retain_graph needed!
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(args.max_grad_norm))
+            clip_grad_by_component(model, max_norm=1.0)  
             optimizer.step()
             scheduler.step()
             

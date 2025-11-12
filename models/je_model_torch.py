@@ -51,7 +51,7 @@ class JEModel(nn.Module):
 
         # Decoder input projection and GRU
         self.dec_inp_proj = nn.Linear(3 * hidden_dim, hidden_dim)
-        self.gru = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
+        self.gru = nn.GRU(hidden_dim, hidden_dim, num_layers=3 ,batch_first=True, dropout=0.1)
 
         # Retrieval projection and gate
         self.retr_mem_proj = nn.Linear(hidden_dim, hidden_dim)

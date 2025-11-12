@@ -26,9 +26,11 @@ class PointerLayer(nn.Module):
         learnable_scale: bool = False,
         scale_init: float = 1.0,
         use_norm: bool = True,
+        logit_clip: float = 10.0,
     ) -> None:
         super().__init__()
         self.temperature = float(max(1e-6, temperature))
+        self.logit_clip = logit_clip
         self.use_norm = bool(use_norm)
         if learnable_scale:
             self.logit_scale = nn.Parameter(torch.tensor(float(scale_init), dtype=torch.float32))
@@ -58,6 +60,12 @@ class PointerLayer(nn.Module):
 
         # Dot product -> [B, C]
         logits = torch.einsum("bh,bch->bc", dec, cat)
+        logits = torch.clamp(
+            logits, 
+            min=-self.logit_clip, 
+            max=self.logit_clip
+        )
+
         # Apply scale and temperature
         logits = (self.logit_scale * logits) / self.temperature
 
