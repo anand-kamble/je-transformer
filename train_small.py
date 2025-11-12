@@ -856,37 +856,37 @@ def main() -> None:
                         qids_batch = [str(x) for x in v_features.get("journal_entry_id", [""] * len(nbrs_v))]
                         retr_query_ids.extend(qids_batch)
                     # Log heatmaps once
-                    if (
-                        retrieval_enabled
-                        and args.log_retrieval_heatmaps
-                        and not first_heatmaps_logged
-                        and "retrieval_weights" in outs_v
-                    ):
-                        try:
-                            rw = outs_v["retrieval_weights"].detach().cpu().numpy()  # [B, T, K]
-                            import numpy as _npimg
-                            images = []
-                            max_items = min(int(args.eval_samples), rw.shape[0])
-                            # If we have neighbor ranks, use them for captions
-                            nbrs_for_caption = nbrs_v if nbrs_v is not None else [[] for _ in range(rw.shape[0])]
-                            for i in range(max_items):
-                                mat = rw[i]  # [T, K]
-                                # Normalize to 0..255 for visualization
-                                mn = float(mat.min()) if mat.size else 0.0
-                                mx = float(mat.max()) if mat.size else 1.0
-                                den = (mx - mn) if (mx - mn) > 1e-8 else 1.0
-                                img = ((mat - mn) / den * 255.0).astype(_npimg.uint8)
-                                # Build caption from neighbor ids if available
-                                cap = ""
-                                if _retr_index_ids is not None and len(nbrs_for_caption) > i:
-                                    nids = [(_retr_index_ids[j] if 0 <= j < len(_retr_index_ids) else "") for j in nbrs_for_caption[i]]
-                                    cap = f"neighbors: {', '.join(nids[:5])}"
-                                images.append(wandb.Image(img, caption=cap))
-                            if images and wandb_enabled:
-                                wandb.log({"retrieval/heatmaps": images})
-                            first_heatmaps_logged = True
-                        except Exception as _img_e:
-                            print(f"[wandb] Warning: failed logging retrieval heatmaps: {_img_e}")
+                    # if (
+                    #     retrieval_enabled
+                    #     and args.log_retrieval_heatmaps
+                    #     and not first_heatmaps_logged
+                    #     and "retrieval_weights" in outs_v
+                    # ):
+                        # try:
+                        #     rw = outs_v["retrieval_weights"].detach().cpu().numpy()  # [B, T, K]
+                        #     import numpy as _npimg
+                        #     images = []
+                        #     max_items = min(int(args.eval_samples), rw.shape[0])
+                        #     # If we have neighbor ranks, use them for captions
+                        #     nbrs_for_caption = nbrs_v if nbrs_v is not None else [[] for _ in range(rw.shape[0])]
+                        #     for i in range(max_items):
+                        #         mat = rw[i]  # [T, K]
+                        #         # Normalize to 0..255 for visualization
+                        #         mn = float(mat.min()) if mat.size else 0.0
+                        #         mx = float(mat.max()) if mat.size else 1.0
+                        #         den = (mx - mn) if (mx - mn) > 1e-8 else 1.0
+                        #         img = ((mat - mn) / den * 255.0).astype(_npimg.uint8)
+                        #         # Build caption from neighbor ids if available
+                        #         cap = ""
+                        #         if _retr_index_ids is not None and len(nbrs_for_caption) > i:
+                        #             nids = [(_retr_index_ids[j] if 0 <= j < len(_retr_index_ids) else "") for j in nbrs_for_caption[i]]
+                        #             cap = f"neighbors: {', '.join(nids[:5])}"
+                        #         images.append(wandb.Image(img, caption=cap))
+                        #     if images and wandb_enabled:
+                        #         wandb.log({"retrieval/heatmaps": images})
+                        #     first_heatmaps_logged = True
+                        # except Exception as _img_e:
+                        #     print(f"[wandb] Warning: failed logging retrieval heatmaps: {_img_e}")
                     val_steps_done += 1
                     if int(args.max_val_batches) > 0 and val_steps_done >= int(args.max_val_batches):
                         break
