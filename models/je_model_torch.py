@@ -122,9 +122,18 @@ class JEModel(nn.Module):
         enc_ctx = enc_proj * (1.0 + gamma) + beta  # [B, H]
 
         # Prepare decoder inputs
-        cat_embs = catalog_embeddings  # [C, H] or [B, C, H]
-        safe_idx = prev_account_idx.clamp_min(0)
-        prev_acc_emb = F.embedding(safe_idx, cat_embs if cat_embs.dim() == 2 else cat_embs[0])  # [B, T, H]
+        cat_for_embed = self.catalog_param if (self._learn_catalog and hasattr(self, "catalog_param")) else catalog_embeddings
+        safe_idx = prev_account_idx.clamp_min(0)  # [B, T]
+
+        if cat_for_embed.dim() == 2:
+            # [C, H]
+            prev_acc_emb = F.embedding(safe_idx, cat_for_embed)  # [B, T, H]
+        else:
+            # [B, C, H] – gather per batch
+            B, T = safe_idx.shape
+            b = torch.arange(B, device=safe_idx.device).unsqueeze(-1).expand(B, T)  # [B, T]
+            prev_acc_emb = cat_for_embed[b, safe_idx]  # [B, T, H]
+
         bos_mask = (prev_account_idx == -1).to(prev_acc_emb.dtype).unsqueeze(-1)
         prev_acc_emb = prev_acc_emb * (1.0 - bos_mask)
 
@@ -158,10 +167,17 @@ class JEModel(nn.Module):
         dec_h_fused = F.relu(self.post_retr_proj(dec_h_fused))
 
         flat_dec = dec_h_fused.reshape(B * T, self.hidden_dim)
-        # Choose catalog embeddings (internal trainable if available)
         cat_for_pointer = self.catalog_param if (self._learn_catalog and hasattr(self, "catalog_param")) else catalog_embeddings
-        logits_flat = self.pointer(flat_dec, cat_for_pointer)
-        pointer_logits = logits_flat.reshape(B, T, -1)
+        if cat_for_pointer.dim() == 3:
+            # [B, C, H] -> [B*T, C, H] by repeating per time step
+            cat_for_pointer = (
+                cat_for_pointer
+                .unsqueeze(1)                 # [B, 1, C, H]
+                .expand(B, T, -1, -1)         # [B, T, C, H]
+                .reshape(B * T, cat_for_pointer.shape[1], cat_for_pointer.shape[2])  # [B*T, C, H]
+            )
+        logits_flat = self.pointer(flat_dec, cat_for_pointer)  # [B*T, C]
+        pointer_logits = logits_flat.reshape(B, T, -1)         # [B, T, C]
 
         side_logits = self.side_head(dec_h_fused)
         stop_logits = self.stop_head(dec_h_fused)

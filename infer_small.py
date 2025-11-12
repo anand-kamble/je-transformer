@@ -229,6 +229,10 @@ def main() -> None:
 		max_lines=args.max_lines,
 		temperature=1.0,
 	).to(device)
+ 
+	if args.trainable_catalog:
+	    model.set_catalog_embeddings(cat_emb)
+     
 	if ckpt_uri:
 		state = load_torch_from_uri(ckpt_uri, map_location=device)
 		state = state.get("model", state)

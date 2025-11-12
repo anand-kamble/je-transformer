@@ -22,7 +22,7 @@ from transformers import get_cosine_schedule_with_warmup
 from models.catalog_encoder import CatalogEncoder
 from models.je_model_torch import JEModel, mean_pool
 from models.losses import (SetF1Metric, coverage_penalty, flow_aux_loss,
-                           pointer_loss, side_loss, stop_loss)
+                           pointer_loss, side_loss, stop_loss, masked_sparse_ce)
 from train.dataset import ParquetJEDataset, collate_fn
 from eval.retrieval_metrics import aggregate_retrieval_metrics
 
@@ -286,6 +286,9 @@ def main() -> None:
 
     artifact = load_json_from_uri(accounts_artifact_path)
     cat_emb = build_catalog_embeddings(artifact, emb_dim=args.hidden_dim, device=device)
+    
+    catalog_size = cat_emb.size(0)
+    
 
     # Build journal_entry_id -> account set mapping for retrieval metrics (from full dataframe)
     jeid_to_accountset: Dict[str, set] = {}
@@ -637,6 +640,15 @@ def main() -> None:
             debit_weights = targets["debit_weights"].to(device)
             credit_indices = targets["credit_indices"].to(device)
             credit_weights = targets["credit_weights"].to(device)
+            
+            # inside the training loop, once per N steps:
+            with torch.no_grad():
+                m = (target_account_idx >= 0)
+                if m.any():
+                    max_idx = int(target_account_idx[m].max().item())
+                    if max_idx >= catalog_size:
+                        raise ValueError(f"Account index {max_idx} >= catalog size {catalog_size}. "
+                                        "Check that dataset indices align with accounts artifact order.")
 
 
             optimizer.zero_grad(set_to_none=True)
@@ -657,7 +669,11 @@ def main() -> None:
             # Compute softmax ONCE
             pointer_probs = torch.softmax(outputs["pointer_logits"], dim=-1)
             side_probs = torch.softmax(outputs["side_logits"], dim=-1)
-
+            
+            # Raw (unnormalized) cross-entropies
+            pl_raw = masked_sparse_ce(outputs["pointer_logits"], target_account_idx, ignore_index=-1)
+            sl_raw = masked_sparse_ce(outputs["side_logits"], target_side_id, ignore_index=-1)
+            stl_raw = masked_sparse_ce(outputs["stop_logits"], target_stop_id, ignore_index=-1)
 
             # Pass probabilities instead of logits where applicable
             pl = pointer_loss(outputs["pointer_logits"], target_account_idx, ignore_index=-1)
@@ -736,9 +752,19 @@ def main() -> None:
                     target_side_id.detach().cpu(),
                     target_stop_id.detach().cpu(),
                 )
+                
+                # True learning rates (after scheduler.step())
+                lr_groups = scheduler.get_last_lr()  # list per param group
+                lr_main = float(optimizer.param_groups[0]["lr"])
+                lr_pointer = float(optimizer.param_groups[1]["lr"]) if len(optimizer.param_groups) > 1 else lr_main
+                lr_mean = float(sum(lr_groups) / max(1, len(lr_groups)))
+
                 print(
-                    f"step {step} loss={total.item():.4f} ptr={pl.item():.4f} side={sl.item():.4f} stop={stl.item():.4f} cov={cov.item():.4f} flow={flow.item():.4f} setF1={metric_set_f1.result().item():.4f} pmax={p_max:.3f} pstd={p_std:.3f}"
+                    f"step {step} loss={total.item():.4f} ptr={pl.item():.4f} side={sl.item():.4f} stop={stl.item():.4f} "
+                    f"ptr_raw={pl_raw.item():.4f} side_raw={sl_raw.item():.4f} stop_raw={stl_raw.item():.4f} "
+                    f"lr_main={lr_main:.6g} lr_ptr={lr_pointer:.6g}"
                 )
+                
                 # Log metrics to wandb
                 if wandb_enabled:
                     try:
@@ -749,6 +775,12 @@ def main() -> None:
                             "train/pointer_loss": pl.item(),
                             "train/side_loss": sl.item(),
                             "train/stop_loss": stl.item(),
+                            "train/pointer_ce_raw": pl_raw.item(),
+                            "train/side_ce_raw": sl_raw.item(),
+                            "train/stop_ce_raw": stl_raw.item(),
+                            "train/lr_main": lr_main,
+                            "train/lr_pointer": lr_pointer,
+                            "train/lr_mean": lr_mean,
                             "train/coverage_penalty": cov.item(),
                             "train/flow_loss": flow.item(),
                             "train/set_f1": metric_set_f1.result().item(),
@@ -970,6 +1002,17 @@ def main() -> None:
                 artifact_data = load_json_from_uri(accounts_artifact_path)
                 with open(accounts_path, "w", encoding="utf-8") as f:
                     json.dump(artifact_data, f, indent=2, ensure_ascii=False)
+                # 3.5. Save catalog embeddings used by the model (trained param if enabled, else static)
+                catalog_emb_path = os.path.join(tmpdir, "catalog_embeddings.pt")
+                try:
+                    cat_src = (
+                        model.catalog_param.detach().cpu()
+                        if (bool(args.trainable_catalog) and hasattr(model, "catalog_param"))
+                        else cat_emb.detach().cpu()
+                    )
+                    torch.save({"catalog_embeddings": cat_src}, catalog_emb_path)
+                except Exception as _ce_save_e:
+                    print(f"Warning: failed to save catalog embeddings: {_ce_save_e}")
                 # 4. Save training metadata
                 metadata_path = os.path.join(tmpdir, "training_metadata.json")
                 with open(metadata_path, "w") as f:
@@ -1035,6 +1078,7 @@ def main() -> None:
                         ("config.json", config_path),
                         ("accounts_artifact.json", accounts_path),
                         ("training_metadata.json", metadata_path),
+                        ("catalog_embeddings.pt", catalog_emb_path)
                     ]:
                         blob = client.bucket(bucket_name).blob(f"{prefix.rstrip('/')}/{fname}")
                         blob.upload_from_filename(fpath)
@@ -1045,6 +1089,7 @@ def main() -> None:
                         ("config.json", config_path),
                         ("accounts_artifact.json", accounts_path),
                         ("training_metadata.json", metadata_path),
+                        ("catalog_embeddings.pt", catalog_emb_path)
                     ]:
                         shutil.copy2(fpath, os.path.join(args.output_dir, fname))
                     print(f"New best (epoch {best_epoch}, loss={best_loss:.4f}) saved to {args.output_dir}")
