@@ -235,7 +235,7 @@ def main() -> None:
 	input_ids = torch.tensor([batch["input_ids"][0]], dtype=torch.long, device=device)
 	attention_mask = torch.tensor([batch["attention_mask"][0]], dtype=torch.long, device=device)
 
-	
+
 	accounts_uri: Optional[str] = args.accounts_artifact
 	if not accounts_uri:
 		cand = _uri_join(base_uri, "accounts_artifact.json")
@@ -245,9 +245,29 @@ def main() -> None:
 			raise FileNotFoundError("Accounts artifact not provided and accounts_artifact.json not found next to checkpoint.")
 	_dbg(args.debug, f"Accounts artifact URI: {accounts_uri}")
 	artifact = load_json_from_uri(accounts_uri)
-	cat_emb = build_catalog_embeddings(artifact, emb_dim=args.hidden_dim, device=device)
-	if args.debug:
-		print(f"[infer] catalog_embeddings shape={tuple(cat_emb.shape)} num_accounts={int(cat_emb.shape[0])} from={accounts_uri}")
+
+	# CRITICAL FIX: Try to load saved catalog embeddings first
+	# If model was trained with --trainable-catalog, we must use the learned embeddings
+	# See ANALYSIS_FINDINGS.md Section 3 for details
+	catalog_emb_uri = _uri_join(base_uri, "catalog_embeddings.pt")
+	if _uri_exists(catalog_emb_uri):
+		try:
+			catalog_data = load_torch_from_uri(catalog_emb_uri, map_location=device)
+			cat_emb = catalog_data["catalog_embeddings"].to(device=device, dtype=torch.float32)
+			_dbg(args.debug, f"[infer] Loaded TRAINED catalog embeddings from {catalog_emb_uri}")
+			if args.debug:
+				print(f"[infer] catalog_embeddings shape={tuple(cat_emb.shape)} num_accounts={int(cat_emb.shape[0])} (loaded from checkpoint)")
+		except Exception as e:
+			_dbg(True, f"[infer] Warning: Failed to load catalog embeddings from {catalog_emb_uri}: {e}")
+			_dbg(True, f"[infer] Falling back to rebuilding catalog embeddings (may cause mismatch if model was trained with --trainable-catalog)")
+			cat_emb = build_catalog_embeddings(artifact, emb_dim=args.hidden_dim, device=device)
+			if args.debug:
+				print(f"[infer] catalog_embeddings shape={tuple(cat_emb.shape)} num_accounts={int(cat_emb.shape[0])} from={accounts_uri} (rebuilt)")
+	else:
+		_dbg(args.debug, f"[infer] No saved catalog embeddings found at {catalog_emb_uri}, rebuilding from scratch")
+		cat_emb = build_catalog_embeddings(artifact, emb_dim=args.hidden_dim, device=device)
+		if args.debug:
+			print(f"[infer] catalog_embeddings shape={tuple(cat_emb.shape)} num_accounts={int(cat_emb.shape[0])} from={accounts_uri} (rebuilt)")
 
 	
 	cond_numeric = torch.zeros((1, 8), dtype=torch.float32, device=device)
