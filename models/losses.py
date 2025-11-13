@@ -294,13 +294,14 @@ def flow_aux_loss(
         target_dist = wts / sum_w  # [B, max_accounts_per_side]
 
         # Normalize gathered probabilities (predicted distribution)
-        # Add small epsilon for numerical stability
-        pred_dist = gathered + 1e-8
-        pred_dist = pred_dist / pred_dist.sum(dim=-1, keepdim=True)
+        # Clamp to avoid log(0) for numerical stability
+        pred_dist = gathered / (gathered.sum(dim=-1, keepdim=True) + 1e-8)
+        pred_dist = torch.clamp(pred_dist, min=1e-8, max=1.0)
+        target_dist = torch.clamp(target_dist, min=1e-8, max=1.0)
 
         # KL(target || pred) = sum(target * log(target / pred))
-        # Use log_softmax for numerical stability
-        kl = target_dist * (torch.log(target_dist + 1e-8) - torch.log(pred_dist + 1e-8))
+        # Clamp ensures numerical stability without log(0)
+        kl = target_dist * (torch.log(target_dist) - torch.log(pred_dist))
         kl = (kl * mask).sum(dim=-1)  # [B]
 
         valid = (mask.sum(dim=-1) > 0).to(kl.dtype)
