@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from inference.retrieval_memory import build_retrieval_memory_for_text
+from models.hierarchy_utils import AccountHierarchy
 
 
 @dataclass
@@ -26,6 +27,35 @@ def length_penalized_score(logprob: float, length: int, alpha: float) -> float:
     if alpha <= 0.0:
         return logprob
     return logprob / (L ** alpha)
+
+
+# Add parent-aware beam expansion
+def expand_with_hierarchy(
+    beam_candidates: List[dict],
+    hierarchy: AccountHierarchy,
+    fallback_threshold: float = 0.3
+):
+    """
+    If top predictions have low confidence, 
+    add parent accounts as additional candidates
+    """
+    expanded = []
+    for cand in beam_candidates:
+        expanded.append(cand)
+        
+        # If confidence is low, consider parent
+        if cand['prob'] < fallback_threshold:
+            last_account = cand['accounts'][-1] if cand['accounts'] else None
+            if last_account is not None:
+                parent_idx = hierarchy.get_parent(last_account)
+                if parent_idx is not None:
+                    parent_cand = cand.copy()
+                    parent_cand['accounts'] = cand['accounts'].copy()
+                    parent_cand['accounts'][-1] = parent_idx
+                    parent_cand['prob'] *= 0.9  # Small penalty for fallback
+                    expanded.append(parent_cand)
+    
+    return expanded
 
 
 def beam_search_decode(

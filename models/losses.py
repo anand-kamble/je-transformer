@@ -6,6 +6,7 @@ from collections import deque
 import torch
 import torch.nn.functional as F
 
+from models.hierarchy_utils import AccountHierarchy
 
 def masked_sparse_ce(logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
     if logits.dim() != 3:
@@ -310,3 +311,47 @@ def flow_aux_loss(
     ld = side_kl_loss(pred_debit_mass, debit_indices, debit_weights)
     lc = side_kl_loss(pred_credit_mass, credit_indices, credit_weights)
     return 0.5 * (ld + lc)
+
+
+# Add to models/losses.py
+def hierarchical_pointer_loss(
+    pointer_logits: torch.Tensor,
+    target_account_idx: torch.Tensor,
+    hierarchy: AccountHierarchy,
+    alpha: float = 0.7,  # Weight for exact match vs parent match
+    ignore_index: int = -1
+) -> torch.Tensor:
+    """
+    Hierarchical loss that gives partial credit for selecting parent accounts
+    """
+    B, T, V = pointer_logits.shape
+    device = pointer_logits.device
+    
+    # Standard CE loss for exact matches
+    exact_loss = masked_sparse_ce(pointer_logits, target_account_idx, ignore_index)
+    
+    # Create soft targets that include parents
+    soft_targets = torch.zeros(B, T, V, device=device)
+    
+    for b in range(B):
+        for t in range(T):
+            target_idx = target_account_idx[b, t].item()
+            if target_idx >= 0 and target_idx != ignore_index:
+                # Full weight to exact target
+                soft_targets[b, t, target_idx] = alpha
+                
+                # Partial weight to ancestors
+                ancestors = hierarchy.get_ancestors(target_idx)
+                if ancestors:
+                    ancestor_weight = (1 - alpha) / len(ancestors)
+                    for anc_idx in ancestors:
+                        if anc_idx < V:
+                            soft_targets[b, t, anc_idx] += ancestor_weight
+    
+    # KL divergence loss against soft targets
+    log_probs = F.log_softmax(pointer_logits, dim=-1)
+    soft_targets = soft_targets / (soft_targets.sum(dim=-1, keepdim=True) + 1e-8)
+    kl_loss = F.kl_div(log_probs, soft_targets, reduction='batchmean')
+    
+    # Combine exact and hierarchical losses
+    return exact_loss + 0.3 * kl_loss

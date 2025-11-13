@@ -20,4 +20,8 @@ dependencies = [
     "sqlalchemy>=2.0.44",
     "wandb>=0.16.0",
     "ipykernel>=7.1.0",
+    "plotly>=6.4.0",
+    "nbformat>=5.10.4",
+    "jupyter>=1.1.1",
+    "geoopt>=0.5.1",
 ]
