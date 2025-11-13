@@ -17,45 +17,30 @@ def masked_sparse_ce(logits: torch.Tensor, targets: torch.Tensor, ignore_index: 
     targets_1d = targets.reshape(B * T)
     mask = (targets_1d != ignore_index).to(logits_2d.dtype)
     safe_targets = torch.where(mask > 0.5, targets_1d, torch.zeros_like(targets_1d))
-    
-    ce = F.cross_entropy(logits_2d, safe_targets, reduction="none")  
+
+    ce = F.cross_entropy(logits_2d, safe_targets, reduction="none")
     ce = ce * mask
     denom = torch.clamp(mask.sum(), min=1.0)
     return ce.sum() / denom
 
-def adaptive_loss_scale(loss: torch.Tensor, momentum: float = 0.99) -> torch.Tensor:
-    if not hasattr(adaptive_loss_scale, 'running_mean'):
-        adaptive_loss_scale.running_mean = 0.0
-        adaptive_loss_scale.running_var = 1.0
-    
-    
-    loss_val = loss.detach().item()
-    adaptive_loss_scale.running_mean = (
-        momentum * adaptive_loss_scale.running_mean + (1 - momentum) * loss_val
-    )
-    adaptive_loss_scale.running_var = (
-        momentum * adaptive_loss_scale.running_var + 
-        (1 - momentum) * (loss_val - adaptive_loss_scale.running_mean) ** 2
-    )
-    
-    
-    running_std = torch.sqrt(torch.tensor(adaptive_loss_scale.running_var + 1e-6))
-    normalized_loss = loss / torch.clamp(running_std, min=0.5, max=5.0)
-    
-    return normalized_loss
-
 
 def pointer_loss(pointer_logits: torch.Tensor, target_account_idx: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
-    loss = masked_sparse_ce(pointer_logits, target_account_idx, ignore_index=ignore_index)
-    return adaptive_loss_scale(loss)
+    """
+    Standard cross-entropy loss for pointer network.
+    Removed adaptive loss scaling as it was causing instability.
+    See ANALYSIS_FINDINGS.md Section 1 for details.
+    """
+    return masked_sparse_ce(pointer_logits, target_account_idx, ignore_index=ignore_index)
 
 
 def side_loss(side_logits: torch.Tensor, target_side_id: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
-    return adaptive_loss_scale(masked_sparse_ce(side_logits, target_side_id, ignore_index=ignore_index))
+    """Standard cross-entropy loss for side prediction."""
+    return masked_sparse_ce(side_logits, target_side_id, ignore_index=ignore_index)
 
 
 def stop_loss(stop_logits: torch.Tensor, target_stop_id: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
-    return adaptive_loss_scale(masked_sparse_ce(stop_logits, target_stop_id, ignore_index=ignore_index))
+    """Standard cross-entropy loss for stop prediction."""
+    return masked_sparse_ce(stop_logits, target_stop_id, ignore_index=ignore_index)
 
 
 def coverage_penalty(pointer_logits: torch.Tensor, max_total: float = 1.0, probs: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -284,33 +269,44 @@ def flow_aux_loss(
     pointer_probs: Optional[torch.Tensor] = None,
     side_probs: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    
-    p = pointer_probs if pointer_probs is not None else torch.softmax(pointer_logits, dim=-1)  
-    s = side_probs if side_probs is not None else torch.softmax(side_logits, dim=-1)  
-    
-    
-    pred_debit_mass = (s[:, :, 0].unsqueeze(-1) * p).sum(dim=1)  
-    pred_credit_mass = (s[:, :, 1].unsqueeze(-1) * p).sum(dim=1)  
-    
-    def side_mse(pred_mass: torch.Tensor, idxs: torch.Tensor, wts: torch.Tensor) -> torch.Tensor:
+    """
+    Flow auxiliary loss using KL divergence instead of MSE.
+    KL divergence is more stable for comparing probability distributions.
+    See ANALYSIS_FINDINGS.md Section 6.1 for details.
+    """
+    p = pointer_probs if pointer_probs is not None else torch.softmax(pointer_logits, dim=-1)
+    s = side_probs if side_probs is not None else torch.softmax(side_logits, dim=-1)
+
+    # Compute predicted mass for each side across all lines
+    pred_debit_mass = (s[:, :, 0].unsqueeze(-1) * p).sum(dim=1)  # [B, num_accounts]
+    pred_credit_mass = (s[:, :, 1].unsqueeze(-1) * p).sum(dim=1)  # [B, num_accounts]
+
+    def side_kl_loss(pred_mass: torch.Tensor, idxs: torch.Tensor, wts: torch.Tensor) -> torch.Tensor:
+        """Use KL divergence instead of MSE for distribution matching."""
         idxs = idxs.clone()
         mask = (idxs >= 0).to(pred_mass.dtype)
         idxs_clamped = idxs.clamp(min=0)
-        gathered = torch.gather(pred_mass, 1, idxs_clamped)  
-        
-        
-        sum_g = gathered.sum(dim=-1, keepdim=True) + 1e-8
-        g_norm = torch.where(sum_g > 0, gathered / sum_g, torch.zeros_like(gathered))
-        
-        
+        gathered = torch.gather(pred_mass, 1, idxs_clamped)  # [B, max_accounts_per_side]
+
+        # Normalize target weights to sum to 1 (target distribution)
         wts = torch.where(mask > 0, wts, torch.zeros_like(wts))
         sum_w = wts.sum(dim=-1, keepdim=True) + 1e-8
-        w_norm = torch.where(sum_w > 0, wts / sum_w, torch.zeros_like(wts))
-        
-        mse = ((g_norm - w_norm) ** 2).mean(dim=-1)  
-        valid = (mask.sum(dim=-1) > 0).to(mse.dtype)
-        return (mse * valid).sum() / (valid.sum() + 1e-6)
-    
-    ld = side_mse(pred_debit_mass, debit_indices, debit_weights)
-    lc = side_mse(pred_credit_mass, credit_indices, credit_weights)
+        target_dist = wts / sum_w  # [B, max_accounts_per_side]
+
+        # Normalize gathered probabilities (predicted distribution)
+        # Clamp to avoid log(0) for numerical stability
+        pred_dist = gathered / (gathered.sum(dim=-1, keepdim=True) + 1e-8)
+        pred_dist = torch.clamp(pred_dist, min=1e-8, max=1.0)
+        target_dist = torch.clamp(target_dist, min=1e-8, max=1.0)
+
+        # KL(target || pred) = sum(target * log(target / pred))
+        # Clamp ensures numerical stability without log(0)
+        kl = target_dist * (torch.log(target_dist) - torch.log(pred_dist))
+        kl = (kl * mask).sum(dim=-1)  # [B]
+
+        valid = (mask.sum(dim=-1) > 0).to(kl.dtype)
+        return (kl * valid).sum() / (valid.sum() + 1e-6)
+
+    ld = side_kl_loss(pred_debit_mass, debit_indices, debit_weights)
+    lc = side_kl_loss(pred_credit_mass, credit_indices, credit_weights)
     return 0.5 * (ld + lc)

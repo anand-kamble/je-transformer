@@ -14,8 +14,8 @@ BATCH_SIZE="${BATCH_SIZE:-32}"
 FINAL_EPOCHS="${EPOCHS:-30}"
 LR="${LR:-1e-4}"
 LIMIT="${LIMIT:-5000}"
-POINTER_TEMP="${POINTER_TEMP:-1.5}"
-POINTER_SCALE_INIT="${POINTER_SCALE_INIT:-2.0}"
+POINTER_TEMP="${POINTER_TEMP:-1.0}"
+POINTER_SCALE_INIT="${POINTER_SCALE_INIT:-10.0}"
 FLOW_WARMUP_EPOCHS="${FLOW_WARMUP_EPOCHS:-3}"
 FLOW_WARMUP_MULT="${FLOW_WARMUP_MULT:-5.0}"
 TOP_K="${TOP_K:-5}"
@@ -128,7 +128,6 @@ echo "[3/3] Training model with retrieval ..."
   --pointer-temp "${POINTER_TEMP}" \
   --pointer-scale-init "${POINTER_SCALE_INIT}" \
   --learnable-pointer-scale \
-  --no-pointer-norm \
   --trainable-catalog \
   --flow-warmup-epochs "${FLOW_WARMUP_EPOCHS}" \
   --flow-warmup-multiplier "${FLOW_WARMUP_MULT}" \
