@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Optional
+from collections import deque
 
 import torch
 import torch.nn.functional as F
@@ -152,6 +153,75 @@ class SetF1Metric:
         self.fp.zero_()
         self.fn.zero_()
 
+
+class WindowedSetF1Metric:
+    """
+    Rolling window SetF1 over recent N steps.
+    Stores per-batch (tp, fp, fn) tuples and computes F1 from rolling sums.
+    """
+
+    def __init__(self, window_size: int = 100, stop_id: int = 1) -> None:
+        self.window_size = int(window_size)
+        self.stop_id = stop_id
+        self.buffer = deque(maxlen=self.window_size)  # type: ignore[var-annotated]
+
+    @torch.no_grad()
+    def update_state(
+        self,
+        pointer_logits: torch.Tensor,
+        side_logits: torch.Tensor,
+        target_accounts: torch.Tensor,
+        target_sides: torch.Tensor,
+        target_stop: Optional[torch.Tensor] = None,
+    ) -> None:
+        pred_accounts = pointer_logits.argmax(dim=-1)  # [B, T]
+        pred_sides = side_logits.argmax(dim=-1)  # [B, T]
+
+        B = pred_accounts.shape[0]
+        if target_stop is not None:
+            has_stop = (target_stop == self.stop_id).any(dim=-1)  # [B]
+            stop_idx = (target_stop == self.stop_id).int().argmax(dim=-1)  # [B]
+        else:
+            has_stop = torch.zeros((B,), dtype=torch.bool)
+            stop_idx = torch.zeros((B,), dtype=torch.int64)
+        tp_val = 0.0
+        fp_val = 0.0
+        fn_val = 0.0
+        for b in range(B):
+            if target_stop is not None and has_stop[b]:
+                L = int(stop_idx[b].item() + 1)
+            else:
+                L = int(pred_accounts.shape[1])
+            pa = pred_accounts[b, :L].tolist()
+            ps = pred_sides[b, :L].tolist()
+            ta = target_accounts[b, :L].tolist()
+            ts = target_sides[b, :L].tolist()
+            pred_pairs = list({(int(a), int(s)) for a, s in zip(pa, ps)})
+            true_pairs = list({(int(a), int(s)) for a, s in zip(ta, ts)})
+            true_set = set(true_pairs)
+            intersection = 0
+            for p in pred_pairs:
+                if p in true_set:
+                    intersection += 1
+            fp_val += max(0, len(pred_pairs) - intersection)
+            fn_val += max(0, len(true_pairs) - intersection)
+            tp_val += float(intersection)
+        self.buffer.append((tp_val, fp_val, fn_val))
+
+    @torch.no_grad()
+    def result(self) -> torch.Tensor:
+        if not self.buffer:
+            return torch.tensor(0.0)
+        tp_sum = sum(t for t, _, _ in self.buffer)
+        fp_sum = sum(f for _, f, _ in self.buffer)
+        fn_sum = sum(n for _, _, n in self.buffer)
+        precision = tp_sum / (tp_sum + fp_sum + 1e-6)
+        recall = tp_sum / (tp_sum + fn_sum + 1e-6)
+        return torch.tensor(2.0 * precision * recall / (precision + recall + 1e-6), dtype=torch.float32)
+
+    @torch.no_grad()
+    def reset_states(self) -> None:
+        self.buffer.clear()
 
 class SetF1Hungarian:
     """Set-level F1 using Hungarian matching (via SciPy) on CPU tensors."""

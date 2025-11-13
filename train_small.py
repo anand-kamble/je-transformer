@@ -22,9 +22,8 @@ from transformers import get_cosine_schedule_with_warmup
 from models.catalog_encoder import CatalogEncoder
 from models.je_model_torch import JEModel, mean_pool
 from models.losses import (SetF1Metric, coverage_penalty, flow_aux_loss,
-                           pointer_loss, side_loss, stop_loss, masked_sparse_ce)
+                           pointer_loss, side_loss, stop_loss, WindowedSetF1Metric)
 from train.dataset import ParquetJEDataset, collate_fn
-from eval.retrieval_metrics import aggregate_retrieval_metrics
 
 
 load_dotenv(override=True)
@@ -131,6 +130,10 @@ def main() -> None:
     parser.add_argument("--retrieval-index-dir", type=str, default=os.environ.get("RETRIEVAL_INDEX_DIR"), help="ScaNN index dir (gs://). Enables retrieval when provided")
     parser.add_argument("--retrieval-top-k", type=int, default=int(os.environ.get("RETRIEVAL_TOP_K", "5")))
     parser.add_argument("--retrieval-use-cls", action="store_true", help="Use [CLS] for pooling the query (defaults to mean pooling)")
+    # Training metrics/logging
+    parser.add_argument("--setf1-window-steps", type=int, default=100, help="Window size for training SetF1 metric")
+    parser.add_argument("--early-stopping-patience", type=int, default=5, help="Epochs with no val/loss improvement before stopping (0=disable)")
+    parser.add_argument("--log-hist-every", type=int, default=0, help="Log pointer logits histogram every N steps (0=disabled)")
     # Validation/eval
     parser.add_argument("--val-ratio", type=float, default=0.1, help="Fraction of training subset reserved for validation")
     parser.add_argument("--max-val-batches", type=int, default=0, help="Max validation batches per epoch (0=all)")
@@ -247,11 +250,16 @@ def main() -> None:
             print(f"All outputs will be saved to: {args.output_dir}")
 
             # Define custom metrics for better visualization
-            wandb.define_metric("step")
             wandb.define_metric("epoch")
-            wandb.define_metric("train/*", step_metric="step")
+            wandb.define_metric("train/*", step_metric="epoch")
             wandb.define_metric("val/*", step_metric="epoch")
-            wandb.define_metric("retrieval/*", step_metric="epoch")
+            # Summaries for key metrics
+            try:
+                wandb.define_metric("val/loss", summary="min")
+                wandb.define_metric("val/set_f1", summary="max")
+                wandb.define_metric("train/loss", summary="min")
+            except Exception:
+                pass
         except Exception as e:
             print(f"Warning: Failed to initialize wandb: {e}")
             wandb_enabled = False
@@ -588,12 +596,7 @@ def main() -> None:
         except Exception as e:
             print(f"Warning: failed to register trainable catalog embeddings: {e}")
     
-    # Monitor model with wandb.watch() (always enabled when wandb is enabled)
-    if wandb_enabled:
-        try:
-            wandb.watch(model, log="gradients", log_freq=100)
-        except Exception as e:
-            print(f"Warning: Failed to enable wandb.watch(): {e}")
+    # Gradient watching removed to reduce logging noise
             
     pointer_params = [p for n, p in model.named_parameters() if 'pointer' in n]
     other_params = [p for n, p in model.named_parameters() if 'pointer' not in n]
@@ -607,9 +610,12 @@ def main() -> None:
 
     # Scheduler with warmup over epochs
     total_steps = max(1, len(dl) * int(args.epochs))
-    warmup_steps = int(0.1 * total_steps)  
+    try:
+        warmup_steps = int(len(dl) * int(args.lr_warmup_epochs))
+    except Exception:
+        warmup_steps = int(0.1 * total_steps)
     scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
-    metric_set_f1 = SetF1Metric()
+    metric_set_f1 = WindowedSetF1Metric(window_size=int(args.setf1_window_steps))
 
 
     model.train()
@@ -617,9 +623,17 @@ def main() -> None:
     best_loss = float("inf")
     best_epoch = 0
     best_metrics: Optional[Dict[str, float]] = None
+    best_val_loss = float("inf")
+    epochs_since_improvement = 0
     for epoch in range(args.epochs):
         # Track last metrics from epoch for checkpoint
         last_metrics = None
+        # Training epoch accumulators (averaged at epoch end)
+        epoch_train_examples = 0
+        train_total_sum = 0.0
+        train_pl_sum = 0.0
+        train_sl_sum = 0.0
+        train_stl_sum = 0.0
         for features, targets in dl:
             step += 1
             optimizer.zero_grad(set_to_none=True)
@@ -669,10 +683,7 @@ def main() -> None:
             pointer_probs = torch.softmax(outputs["pointer_logits"], dim=-1)
             side_probs = torch.softmax(outputs["side_logits"], dim=-1)
             
-            # Raw (unnormalized) cross-entropies
-            pl_raw = masked_sparse_ce(outputs["pointer_logits"], target_account_idx, ignore_index=-1)
-            sl_raw = masked_sparse_ce(outputs["side_logits"], target_side_id, ignore_index=-1)
-            stl_raw = masked_sparse_ce(outputs["stop_logits"], target_stop_id, ignore_index=-1)
+            # Raw (unnormalized) cross-entropies removed from logging
 
             # Pass probabilities instead of logits where applicable
             pl = pointer_loss(outputs["pointer_logits"], target_account_idx, ignore_index=-1)
@@ -711,13 +722,18 @@ def main() -> None:
             all_finite = _finite(total) and _finite(pl) and _finite(sl) and _finite(stl) and _finite(cov) and _finite(flow)
             if not all_finite:
                 print("[anomaly] Non-finite loss component detected; skipping optimizer step.")
-                if wandb_enabled:
-                    try:
-                        wandb.log({"anomaly/non_finite_loss": 1, "epoch": epoch, "step": step})
-                    except Exception:
-                        pass
                 optimizer.zero_grad(set_to_none=True)
                 continue
+            # Accumulate training loss components for epoch averages
+            try:
+                B = int(input_ids.size(0))
+            except Exception:
+                B = 1
+            epoch_train_examples += B
+            train_total_sum += float(total.item()) * B
+            train_pl_sum += float(pl.item()) * B
+            train_sl_sum += float(sl.item()) * B
+            train_stl_sum += float(stl.item()) * B
             total.backward()  # No retain_graph needed!
             clip_grad_by_component(model, max_norm=1.0)  
             optimizer.step()
@@ -744,73 +760,28 @@ def main() -> None:
             }
 
 
-            if step % 100 == 0:
-                # Pointer logit stats for diagnostics
-                try:
-                    p_logits = outputs["pointer_logits"].detach()
-                    p_max = float(p_logits.max().item())
-                    p_min = float(p_logits.min().item())
-                    p_std = float(p_logits.std().item())
-                except Exception:
-                    p_max = p_min = p_std = 0.0
-                
-                # True learning rates (after scheduler.step())
-                lr_groups = scheduler.get_last_lr()  # list per param group
-                lr_main = float(optimizer.param_groups[0]["lr"])
-                lr_pointer = float(optimizer.param_groups[1]["lr"]) if len(optimizer.param_groups) > 1 else lr_main
-                lr_mean = float(sum(lr_groups) / max(1, len(lr_groups)))
-
-                print(
-                    f"step {step} loss={total.item():.4f} ptr={pl.item():.4f} side={sl.item():.4f} stop={stl.item():.4f} "
-                    f"ptr_raw={pl_raw.item():.4f} side_raw={sl_raw.item():.4f} stop_raw={stl_raw.item():.4f} "
-                    f"lr_main={lr_main:.6g} lr_ptr={lr_pointer:.6g}"
-                )
-                
-                # Log metrics to wandb
-                if wandb_enabled:
-                    try:
-                        wandb.log({
-                            "step": step,
-                            "epoch": epoch,
-                            "train/loss": total.item(),
-                            "train/pointer_loss": pl.item(),
-                            "train/side_loss": sl.item(),
-                            "train/stop_loss": stl.item(),
-                            "train/pointer_ce_raw": pl_raw.item(),
-                            "train/side_ce_raw": sl_raw.item(),
-                            "train/stop_ce_raw": stl_raw.item(),
-                            "train/lr_main": lr_main,
-                            "train/lr_pointer": lr_pointer,
-                            "train/lr_mean": lr_mean,
-                            "train/coverage_penalty": cov.item(),
-                            "train/flow_loss": flow.item(),
-                            "train/set_f1": metric_set_f1.result().item(),
-                            "train/pointer_logit_max": p_max,
-                            "train/pointer_logit_min": p_min,
-                            "train/pointer_logit_std": p_std,
-                            "train/flow_weight_now": loss_weights.get("flow", float(args.flow_weight)),
-                            "train/coverage_weight_now": loss_weights.get("coverage", 0.01),
-                        })
-                    except Exception as e:
-                        print(f"Warning: Failed to log to wandb: {e}")
-                # Reset windowed SetF1 after logging to keep metric recent
-                _reset = getattr(metric_set_f1, "reset", None)
-                if callable(_reset):
-                    _reset()
+            # Windowed SetF1 rolls automatically; no manual reset
         
+        # Compute training epoch averages
+        train_ex_den = float(max(epoch_train_examples, 1))
+        train_logs = {
+            "epoch": epoch,
+            "train/loss": (train_total_sum / train_ex_den),
+            "train/pointer_loss": (train_pl_sum / train_ex_den),
+            "train/side_loss": (train_sl_sum / train_ex_den),
+            "train/stop_loss": (train_stl_sum / train_ex_den),
+        }
+
         # End-of-epoch validation
         if dl_val is not None:
             model.eval()
             val_steps_done = 0
-            val_total = 0.0
-            val_pl = 0.0
-            val_sl = 0.0
-            val_stl = 0.0
-            val_cov = 0.0
-            val_flow = 0.0
-            val_pl_ce_raw = 0.0
-            val_sl_ce_raw = 0.0
-            val_stl_ce_raw = 0.0
+            # Aggregation by examples and tokens
+            val_examples = 0
+            val_total_sum = 0.0
+            val_pl_sum = 0.0
+            val_sl_sum = 0.0
+            val_stl_sum = 0.0
             val_metric = SetF1Metric()
             # Retrieval metrics aggregation buffers
             retr_query_ids: List[str] = []
@@ -869,9 +840,6 @@ def main() -> None:
                     )
                     # Apply same weights as training (no extra normalization)
                     loss_weights_v = get_loss_weights(epoch, args.epochs)
-                    pl_ce_raw_v = masked_sparse_ce(outs_v["pointer_logits"], tgt_acc_v, ignore_index=-1)
-                    sl_ce_raw_v = masked_sparse_ce(outs_v["side_logits"], tgt_side_v, ignore_index=-1)
-                    stl_ce_raw_v = masked_sparse_ce(outs_v["stop_logits"], tgt_stop_v, ignore_index=-1)
                     total_v = (
                         pl_v
                         + sl_v
@@ -879,15 +847,14 @@ def main() -> None:
                         + cov_v * loss_weights_v['coverage']
                         + flow_v * loss_weights_v['flow']
                     )
-                    val_total += float(total_v.item())
-                    val_pl += float(pl_v.item())
-                    val_sl += float(sl_v.item())
-                    val_stl += float(stl_v.item())
-                    val_cov += float(cov_v.item())
-                    val_flow += float(flow_v.item())
-                    val_pl_ce_raw += float(pl_ce_raw_v.item())
-                    val_sl_ce_raw += float(sl_ce_raw_v.item())
-                    val_stl_ce_raw += float(stl_ce_raw_v.item())
+                    # Aggregations
+                    Bv = int(input_ids_v.size(0))
+                    val_examples += Bv
+                    val_total_sum += float(total_v.item()) * Bv
+                    val_pl_sum += float(pl_v.item()) * Bv
+                    val_sl_sum += float(sl_v.item()) * Bv
+                    val_stl_sum += float(stl_v.item()) * Bv
+                    # token-level validity counts removed (unused)
                     val_metric.update_state(
                         outs_v["pointer_logits"].detach().cpu(),
                         outs_v["side_logits"].detach().cpu(),
@@ -936,179 +903,261 @@ def main() -> None:
                     if int(args.max_val_batches) > 0 and val_steps_done >= int(args.max_val_batches):
                         break
             # Finalize val metrics
-            den = float(max(val_steps_done, 1))
+            ex_den = float(max(val_examples, 1))
             val_logs = {
                 "epoch": epoch,
-                "val/loss": val_total / den,
-                "val/pointer_loss": val_pl / den,
-                "val/side_loss": val_sl / den,
-                "val/stop_loss": val_stl / den,
-                "val/coverage_penalty": val_cov / den,
-                "val/flow_loss": val_flow / den,
+                "val/loss": val_total_sum / ex_den,
+                "val/pointer_loss": val_pl_sum / ex_den,
+                "val/side_loss": val_sl_sum / ex_den,
+                "val/stop_loss": val_stl_sum / ex_den,
                 "val/set_f1": float(val_metric.result().item()) if hasattr(val_metric, "result") else 0.0,
-                "val/pointer_ce_raw": val_pl_ce_raw / den,
-                "val/side_ce_raw": val_sl_ce_raw / den,
-                "val/stop_ce_raw": val_stl_ce_raw / den,
             }
+            # Log combined train/val metrics once per epoch
             if wandb_enabled:
                 try:
-                    wandb.log(val_logs)
+                    _combined_logs = dict(train_logs)
+                    _combined_logs.update(val_logs)
+                    wandb.log(_combined_logs)
                 except Exception as _vlog_e:
-                    print(f"[wandb] Warning: failed logging val metrics: {_vlog_e}")
-            # Retrieval quality metrics
-            if retrieval_enabled and _retr_index_ids is not None and retr_query_ids and retr_topk_indices:
-                try:
-                    retr_metrics = aggregate_retrieval_metrics(
-                        query_ids=retr_query_ids,
-                        topk_indices=retr_topk_indices,
-                        index_ids=_retr_index_ids,
-                        jeid_to_accountset=jeid_to_accountset,
-                    )
-                    retr_logs = {f"retrieval/{k}": float(v) for k, v in retr_metrics.items()}
-                    retr_logs["epoch"] = epoch
-                    if wandb_enabled:
-                        wandb.log(retr_logs)
-                except Exception as _rme:
-                    print(f"[retrieval-metrics] Warning: failed to compute/log retrieval metrics: {_rme}")
-            model.train()
-
-        # Use last metrics from epoch, or default if none available
-        if last_metrics is None:
-            # Fallback if no metrics were recorded
-            last_metrics = {
-                "loss": 0.0,
-                "pointer_loss": 0.0,
-                "side_loss": 0.0,
-                "stop_loss": 0.0,
-                "coverage_penalty": 0.0,
-                "flow_loss": 0.0,
-                "set_f1": metric_set_f1.result().item() if hasattr(metric_set_f1, 'result') else 0.0,
-            }
-        current_metrics = last_metrics
-
-        # Save only if this is the best so far (by lowest loss)
-        current_loss = float(current_metrics.get("loss", float("inf")))
-        if current_loss < best_loss:
-            best_loss = current_loss
-            best_epoch = epoch + 1
-            best_metrics = dict(current_metrics)
-            with tempfile.TemporaryDirectory() as tmpdir:
-                # 1. Save model_state.pt (for inference)
-                model_state_path = os.path.join(tmpdir, "model_state.pt")
-                torch.save({"model": model.state_dict()}, model_state_path)
-                # 2. Save model config
-                config_path = os.path.join(tmpdir, "config.json")
-                with open(config_path, "w") as f:
-                    json.dump({
-                        "encoder": args.encoder,
-                        "hidden_dim": args.hidden_dim,
-                        "max_lines": args.max_lines,
-                        "max_length": args.max_length,
-                        "temperature": float(args.pointer_temp),
-                        "pointer_scale_init": float(args.pointer_scale_init),
-                        "learnable_pointer_scale": bool(args.learnable_pointer_scale),
-                        "pointer_use_norm": not args.no_pointer_norm,
-                        "trainable_catalog": bool(args.trainable_catalog),
-                        "retrieval_index_dir": args.retrieval_index_dir,
-                        "retrieval_top_k": int(args.retrieval_top_k),
-                        "retrieval_use_cls": bool(args.retrieval_use_cls),
-                    }, f, indent=2)
-                # 3. Save accounts artifact
-                accounts_path = os.path.join(tmpdir, "accounts_artifact.json")
-                artifact_data = load_json_from_uri(accounts_artifact_path)
-                with open(accounts_path, "w", encoding="utf-8") as f:
-                    json.dump(artifact_data, f, indent=2, ensure_ascii=False)
-                # 3.5. Save catalog embeddings used by the model (trained param if enabled, else static)
-                catalog_emb_path = os.path.join(tmpdir, "catalog_embeddings.pt")
-                try:
-                    cat_src = (
-                        model.catalog_param.detach().cpu()
-                        if (bool(args.trainable_catalog) and hasattr(model, "catalog_param"))
-                        else cat_emb.detach().cpu()
-                    )
-                    torch.save({"catalog_embeddings": cat_src}, catalog_emb_path)
-                except Exception as _ce_save_e:
-                    print(f"Warning: failed to save catalog embeddings: {_ce_save_e}")
-                # 4. Save training metadata
-                metadata_path = os.path.join(tmpdir, "training_metadata.json")
-                with open(metadata_path, "w") as f:
-                    json.dump({
-                        "run_name": run_name,
-                        "best_epoch": best_epoch,
-                        "step": step,
-                        "total_steps": len(dl) * (epoch + 1),
-                        "hyperparameters": {
+                    print(f"[wandb] Warning: failed logging epoch metrics: {_vlog_e}")
+            # Retrieval quality metrics logging removed by cleanup
+            # Selection and checkpointing by val/loss
+            current_selection_loss = float(val_logs["val/loss"])
+            if current_selection_loss < best_val_loss:
+                best_val_loss = current_selection_loss
+                best_epoch = epoch + 1
+                best_metrics = dict(val_logs)
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    # 1. Save model_state.pt (for inference)
+                    model_state_path = os.path.join(tmpdir, "model_state.pt")
+                    torch.save({"model": model.state_dict()}, model_state_path)
+                    # 2. Save model config
+                    config_path = os.path.join(tmpdir, "config.json")
+                    with open(config_path, "w") as f:
+                        json.dump({
                             "encoder": args.encoder,
                             "hidden_dim": args.hidden_dim,
                             "max_lines": args.max_lines,
                             "max_length": args.max_length,
-                            "batch_size": args.batch_size,
-                            "epochs": args.epochs,
-                            "lr": args.lr,
-                            "flow_weight": args.flow_weight,
-                            "pointer_temp": args.pointer_temp,
-                            "pointer_scale_init": args.pointer_scale_init,
-                            "learnable_pointer_scale": args.learnable_pointer_scale,
+                            "temperature": float(args.pointer_temp),
+                            "pointer_scale_init": float(args.pointer_scale_init),
+                            "learnable_pointer_scale": bool(args.learnable_pointer_scale),
                             "pointer_use_norm": not args.no_pointer_norm,
-                            "trainable_catalog": args.trainable_catalog,
-                            "flow_warmup_epochs": args.flow_warmup_epochs,
-                            "flow_warmup_multiplier": args.flow_warmup_multiplier,
+                            "trainable_catalog": bool(args.trainable_catalog),
                             "retrieval_index_dir": args.retrieval_index_dir,
-                            "retrieval_top_k": args.retrieval_top_k,
-                            "retrieval_use_cls": args.retrieval_use_cls,
-                            "limit": args.limit,
-                            "seed": args.seed,
-                        },
-                        "metrics": best_metrics,
-                    }, f, indent=2)
-
-                # Log wandb artifact for best only
-                if wandb_enabled:
+                            "retrieval_top_k": int(args.retrieval_top_k),
+                            "retrieval_use_cls": bool(args.retrieval_use_cls),
+                        }, f, indent=2)
+                    # 3. Save accounts artifact
+                    accounts_path = os.path.join(tmpdir, "accounts_artifact.json")
+                    artifact_data = load_json_from_uri(accounts_artifact_path)
+                    with open(accounts_path, "w", encoding="utf-8") as f:
+                        json.dump(artifact_data, f, indent=2, ensure_ascii=False)
+                    # 3.5. Save catalog embeddings used by the model (trained param if enabled, else static)
+                    catalog_emb_path = os.path.join(tmpdir, "catalog_embeddings.pt")
                     try:
-                        artifact = wandb.Artifact(
-                            name="model-best",
-                            type="model",
-                            metadata={
-                                "epoch": best_epoch,
-                                "step": step,
-                                "set_f1": best_metrics.get("set_f1", 0.0),
-                                "loss": best_metrics.get("loss", 0.0),
-                            }
+                        cat_src = (
+                            model.catalog_param.detach().cpu()
+                            if (bool(args.trainable_catalog) and hasattr(model, "catalog_param"))
+                            else cat_emb.detach().cpu()
                         )
-                        artifact.add_file(model_state_path, name="model_state.pt")
-                        artifact.add_file(config_path, name="config.json")
-                        artifact.add_file(accounts_path, name="accounts_artifact.json")
-                        artifact.add_file(metadata_path, name="training_metadata.json")
-                        wandb.log_artifact(artifact)
-                    except Exception as e:
-                        print(f"Warning: Failed to log wandb artifact: {e}")
+                        torch.save({"catalog_embeddings": cat_src}, catalog_emb_path)
+                    except Exception as _ce_save_e:
+                        print(f"Warning: failed to save catalog embeddings: {_ce_save_e}")
+                    # 4. Save training metadata
+                    metadata_path = os.path.join(tmpdir, "training_metadata.json")
+                    with open(metadata_path, "w") as f:
+                        json.dump({
+                            "run_name": run_name,
+                            "best_epoch": best_epoch,
+                            "step": step,
+                            "total_steps": len(dl) * (epoch + 1),
+                            "hyperparameters": {
+                                "encoder": args.encoder,
+                                "hidden_dim": args.hidden_dim,
+                                "max_lines": args.max_lines,
+                                "max_length": args.max_length,
+                                "batch_size": args.batch_size,
+                                "epochs": args.epochs,
+                                "lr": args.lr,
+                                "flow_weight": args.flow_weight,
+                                "pointer_temp": args.pointer_temp,
+                                "pointer_scale_init": args.pointer_scale_init,
+                                "learnable_pointer_scale": args.learnable_pointer_scale,
+                                "pointer_use_norm": not args.no_pointer_norm,
+                                "trainable_catalog": args.trainable_catalog,
+                                "flow_warmup_epochs": args.flow_warmup_epochs,
+                                "flow_warmup_multiplier": args.flow_warmup_multiplier,
+                                "retrieval_index_dir": args.retrieval_index_dir,
+                                "retrieval_top_k": args.retrieval_top_k,
+                                "retrieval_use_cls": args.retrieval_use_cls,
+                                "limit": args.limit,
+                                "seed": args.seed,
+                                "setf1_window_steps": args.setf1_window_steps,
+                                "early_stopping_patience": args.early_stopping_patience,
+                                "log_hist_every": args.log_hist_every,
+                            },
+                            "metrics": {
+                                "val_loss": best_val_loss,
+                                "val_set_f1": val_logs.get("val/set_f1", 0.0),
+                            },
+                        }, f, indent=2)
 
-                # Save best files to output dir (local or GCS)
-                if args.output_dir.startswith("gs://"):
-                    from google.cloud import storage
-                    client = storage.Client()
-                    _, path = args.output_dir.split("gs://", 1)
-                    bucket_name, prefix = path.split("/", 1)
-                    for fname, fpath in [
-                        ("model_state.pt", model_state_path),
-                        ("config.json", config_path),
-                        ("accounts_artifact.json", accounts_path),
-                        ("training_metadata.json", metadata_path),
-                        ("catalog_embeddings.pt", catalog_emb_path)
-                    ]:
-                        blob = client.bucket(bucket_name).blob(f"{prefix.rstrip('/')}/{fname}")
-                        blob.upload_from_filename(fpath)
-                    print(f"New best (epoch {best_epoch}, loss={best_loss:.4f}) uploaded to {args.output_dir}")
-                else:
-                    for fname, fpath in [
-                        ("model_state.pt", model_state_path),
-                        ("config.json", config_path),
-                        ("accounts_artifact.json", accounts_path),
-                        ("training_metadata.json", metadata_path),
-                        ("catalog_embeddings.pt", catalog_emb_path)
-                    ]:
-                        shutil.copy2(fpath, os.path.join(args.output_dir, fname))
-                    print(f"New best (epoch {best_epoch}, loss={best_loss:.4f}) saved to {args.output_dir}")
+                    # Do not upload W&B artifacts (disabled by cleanup)
+
+                    # Save best files to output dir (local or GCS)
+                    if args.output_dir.startswith("gs://"):
+                        from google.cloud import storage
+                        client = storage.Client()
+                        _, path = args.output_dir.split("gs://", 1)
+                        bucket_name, prefix = path.split("/", 1)
+                        for fname, fpath in [
+                            ("model_state.pt", model_state_path),
+                            ("config.json", config_path),
+                            ("accounts_artifact.json", accounts_path),
+                            ("training_metadata.json", metadata_path),
+                            ("catalog_embeddings.pt", catalog_emb_path)
+                        ]:
+                            blob = client.bucket(bucket_name).blob(f"{prefix.rstrip('/')}/{fname}")
+                            blob.upload_from_filename(fpath)
+                        print(f"New best (epoch {best_epoch}, val_loss={best_val_loss:.4f}) uploaded to {args.output_dir}")
+                    else:
+                        for fname, fpath in [
+                            ("model_state.pt", model_state_path),
+                            ("config.json", config_path),
+                            ("accounts_artifact.json", accounts_path),
+                            ("training_metadata.json", metadata_path),
+                            ("catalog_embeddings.pt", catalog_emb_path)
+                        ]:
+                            shutil.copy2(fpath, os.path.join(args.output_dir, fname))
+                        print(f"New best (epoch {best_epoch}, val_loss={best_val_loss:.4f}) saved to {args.output_dir}")
+                epochs_since_improvement = 0
+            else:
+                epochs_since_improvement += 1
+            model.train()
+
+        # If no validation loader exists, fall back to training-loss selection
+        if dl_val is None:
+            # Log training metrics once per epoch
+            if wandb_enabled:
+                try:
+                    wandb.log(train_logs)
+                except Exception as _tlog_e:
+                    print(f"[wandb] Warning: failed logging train epoch metrics: {_tlog_e}")
+            if last_metrics is None:
+                last_metrics = {
+                    "loss": 0.0,
+                    "pointer_loss": 0.0,
+                    "side_loss": 0.0,
+                    "stop_loss": 0.0,
+                    "coverage_penalty": 0.0,
+                    "flow_loss": 0.0,
+                    "set_f1": metric_set_f1.result().item() if hasattr(metric_set_f1, 'result') else 0.0,
+                }
+            current_loss = float(last_metrics.get("loss", float("inf")))
+            if current_loss < best_loss:
+                best_loss = current_loss
+                best_epoch = epoch + 1
+                best_metrics = dict(last_metrics)
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    # Save model, config, accounts, catalog embeddings, metadata
+                    model_state_path = os.path.join(tmpdir, "model_state.pt")
+                    torch.save({"model": model.state_dict()}, model_state_path)
+                    config_path = os.path.join(tmpdir, "config.json")
+                    with open(config_path, "w") as f:
+                        json.dump({
+                            "encoder": args.encoder,
+                            "hidden_dim": args.hidden_dim,
+                            "max_lines": args.max_lines,
+                            "max_length": args.max_length,
+                            "temperature": float(args.pointer_temp),
+                            "pointer_scale_init": float(args.pointer_scale_init),
+                            "learnable_pointer_scale": bool(args.learnable_pointer_scale),
+                            "pointer_use_norm": not args.no_pointer_norm,
+                            "trainable_catalog": bool(args.trainable_catalog),
+                            "retrieval_index_dir": args.retrieval_index_dir,
+                            "retrieval_top_k": int(args.retrieval_top_k),
+                            "retrieval_use_cls": bool(args.retrieval_use_cls),
+                        }, f, indent=2)
+                    accounts_path = os.path.join(tmpdir, "accounts_artifact.json")
+                    artifact_data = load_json_from_uri(accounts_artifact_path)
+                    with open(accounts_path, "w", encoding="utf-8") as f:
+                        json.dump(artifact_data, f, indent=2, ensure_ascii=False)
+                    catalog_emb_path = os.path.join(tmpdir, "catalog_embeddings.pt")
+                    try:
+                        cat_src = (
+                            model.catalog_param.detach().cpu()
+                            if (bool(args.trainable_catalog) and hasattr(model, "catalog_param"))
+                            else cat_emb.detach().cpu()
+                        )
+                        torch.save({"catalog_embeddings": cat_src}, catalog_emb_path)
+                    except Exception as _ce_save_e:
+                        print(f"Warning: failed to save catalog embeddings: {_ce_save_e}")
+                    metadata_path = os.path.join(tmpdir, "training_metadata.json")
+                    with open(metadata_path, "w") as f:
+                        json.dump({
+                            "run_name": run_name,
+                            "best_epoch": best_epoch,
+                            "step": step,
+                            "total_steps": len(dl) * (epoch + 1),
+                            "hyperparameters": {
+                                "encoder": args.encoder,
+                                "hidden_dim": args.hidden_dim,
+                                "max_lines": args.max_lines,
+                                "max_length": args.max_length,
+                                "batch_size": args.batch_size,
+                                "epochs": args.epochs,
+                                "lr": args.lr,
+                                "flow_weight": args.flow_weight,
+                                "pointer_temp": args.pointer_temp,
+                                "pointer_scale_init": args.pointer_scale_init,
+                                "learnable_pointer_scale": args.learnable_pointer_scale,
+                                "pointer_use_norm": not args.no_pointer_norm,
+                                "trainable_catalog": args.trainable_catalog,
+                                "flow_warmup_epochs": args.flow_warmup_epochs,
+                                "flow_warmup_multiplier": args.flow_warmup_multiplier,
+                                "retrieval_index_dir": args.retrieval_index_dir,
+                                "retrieval_top_k": args.retrieval_top_k,
+                                "retrieval_use_cls": args.retrieval_use_cls,
+                                "limit": args.limit,
+                                "seed": args.seed,
+                                "setf1_window_steps": args.setf1_window_steps,
+                                "early_stopping_patience": args.early_stopping_patience,
+                                "log_hist_every": args.log_hist_every,
+                            },
+                            "metrics": best_metrics,
+                        }, f, indent=2)
+                    # Do not upload W&B artifacts (disabled by cleanup)
+                    if args.output_dir.startswith("gs://"):
+                        from google.cloud import storage
+                        client = storage.Client()
+                        _, path = args.output_dir.split("gs://", 1)
+                        bucket_name, prefix = path.split("/", 1)
+                        for fname, fpath in [
+                            ("model_state.pt", model_state_path),
+                            ("config.json", config_path),
+                            ("accounts_artifact.json", accounts_path),
+                            ("training_metadata.json", metadata_path),
+                            ("catalog_embeddings.pt", catalog_emb_path)
+                        ]:
+                            blob = client.bucket(bucket_name).blob(f"{prefix.rstrip('/')}/{fname}")
+                            blob.upload_from_filename(fpath)
+                        print(f"New best (epoch {best_epoch}, loss={best_loss:.4f}) uploaded to {args.output_dir}")
+                    else:
+                        for fname, fpath in [
+                            ("model_state.pt", model_state_path),
+                            ("config.json", config_path),
+                            ("accounts_artifact.json", accounts_path),
+                            ("training_metadata.json", metadata_path),
+                            ("catalog_embeddings.pt", catalog_emb_path)
+                        ]:
+                            shutil.copy2(fpath, os.path.join(args.output_dir, fname))
+                        print(f"New best (epoch {best_epoch}, loss={best_loss:.4f}) saved to {args.output_dir}")
+        # Early stopping check (only with validation and patience > 0)
+        if dl_val is not None and int(args.early_stopping_patience) > 0:
+            if epochs_since_improvement >= int(args.early_stopping_patience):
+                print(f"Early stopping: no val/loss improvement for {epochs_since_improvement} epochs at epoch {epoch+1}.")
+                break
 
     # Only the best checkpoint is saved during training; nothing else to do here.
     
@@ -1121,8 +1170,9 @@ def main() -> None:
                 "final_set_f1": metric_set_f1.result().item(),
                 "output_directory": args.output_dir,
                 "best_epoch": best_epoch,
-                "best_loss": best_loss,
-                "best_set_f1": (best_metrics.get("set_f1") if isinstance(best_metrics, dict) else None) if best_metrics is not None else None,
+                "best_val_loss": best_val_loss if best_val_loss < float('inf') else None,
+                "best_train_loss": best_loss if best_loss < float('inf') else None,
+                "best_set_f1": (best_metrics.get("val/set_f1") if isinstance(best_metrics, dict) else None) if best_metrics is not None else None,
             })
             wandb.finish()
         except Exception as e:
