@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 from __future__ import annotations
 
 import argparse
@@ -53,7 +53,7 @@ def _uri_join(base: str, name: str) -> str:
 
 def _uri_dirname(uri: str) -> str:
 	if uri.startswith("gs://"):
-		# Trim last path segment
+		
 		return uri.rsplit("/", 1)[0]
 	return os.path.dirname(uri)
 
@@ -112,12 +112,12 @@ def _list_runs_gcs(root: str, debug: bool = False) -> List[Tuple[str, float]]:
 			prefix = prefix + "/"
 		bucket = client.bucket(bucket_name)
 		_dbg(debug, f"Listing GCS runs: bucket={bucket_name} prefix={prefix}")
-		# Gather first-level subdirs and their latest updated time
+		
 		latest_ts_by_run = defaultdict(float)
 		count = 0
 		for blob in client.list_blobs(bucket, prefix=prefix):
 			count += 1
-			# Expect names like prefix + run_name + "/..."
+			
 			name = blob.name
 			if not name.startswith(prefix):
 				continue
@@ -168,7 +168,7 @@ def main() -> None:
 
 	device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu"))
 
-	# Optional: list runs and exit
+	
 	if args.list_runs:
 		_dbg(True, f"Listing runs under root: {args.runs_root}")
 		runs = list_runs(args.runs_root, debug=True)
@@ -179,10 +179,10 @@ def main() -> None:
 			print(f"{name}\t{ts}")
 		return
 
-	# Resolve checkpoint path/URI and base directory/URI
+	
 	_dbg(args.debug, f"Initial args.runs_root={args.runs_root} args.run_name={args.run_name} args.use_latest_run={args.use_latest_run} args.checkpoint={args.checkpoint}")
 	ckpt_uri = args.checkpoint
-	# If a run name is provided or latest-run requested, construct checkpoint from runs-root/run-name
+	
 	if args.run_name or args.use_latest_run:
 		base_uri_sel = None
 		if args.run_name:
@@ -208,13 +208,13 @@ def main() -> None:
 	_dbg(args.debug, f"Final checkpoint URI: {ckpt_uri}")
 	_dbg(args.debug, f"Base URI for side files: {base_uri}")
 
-	# Load config.json from alongside checkpoint if present and use to override core params
+	
 	cfg: Dict[str, Any] = {}
 	config_uri = _uri_join(base_uri, "config.json")
 	if _uri_exists(config_uri):
 		try:
 			cfg = load_json_from_uri(config_uri)
-			# Override core hyperparameters from training config
+			
 			args.encoder = cfg.get("encoder", args.encoder)
 			args.hidden_dim = int(cfg.get("hidden_dim", args.hidden_dim))
 			args.max_lines = int(cfg.get("max_lines", args.max_lines))
@@ -227,7 +227,7 @@ def main() -> None:
 	else:
 		_dbg(args.debug, f"No config.json found at {config_uri}")
 
-	# Tokenize description
+	
 	_dbg(args.debug, f"Tokenizing description: '{args.description.strip()}' with encoder '{args.encoder}' max_length={args.max_length}")
 	tok = DescriptionTokenizer(model_name_or_path=args.encoder, max_length=args.max_length)
 	desc = args.description.strip()
@@ -235,7 +235,7 @@ def main() -> None:
 	input_ids = torch.tensor([batch["input_ids"][0]], dtype=torch.long, device=device)
 	attention_mask = torch.tensor([batch["attention_mask"][0]], dtype=torch.long, device=device)
 
-	# Catalog embeddings
+	
 	accounts_uri: Optional[str] = args.accounts_artifact
 	if not accounts_uri:
 		cand = _uri_join(base_uri, "accounts_artifact.json")
@@ -249,7 +249,7 @@ def main() -> None:
 	if args.debug:
 		print(f"[infer] catalog_embeddings shape={tuple(cat_emb.shape)} num_accounts={int(cat_emb.shape[0])} from={accounts_uri}")
 
-	# Optional date-based numeric conditioning features
+	
 	cond_numeric = torch.zeros((1, 8), dtype=torch.float32, device=device)
 	if args.date:
 		try:
@@ -257,7 +257,7 @@ def main() -> None:
 			year = float(d.year)
 			month = float(d.month)
 			day = float(d.day)
-			# Monday=0..Sunday=6 to match dataset usage
+			
 			dow = float(d.weekday())
 			month_sin = math.sin(2.0 * math.pi * ((month - 1.0) / 12.0))
 			month_cos = math.cos(2.0 * math.pi * ((month - 1.0) / 12.0))
@@ -269,14 +269,14 @@ def main() -> None:
 		except Exception as e:
 			print(f"[infer] Warning: failed to parse --date='{args.date}': {e}. Falling back to zeros for cond_numeric.")
 
-	# Model
+	
 	_dbg(args.debug, f"Creating JEModel with hidden_dim={args.hidden_dim} max_lines={args.max_lines}")
-	# Pull pointer settings from training config if present
+	
 	ptr_temp = float(cfg.get("temperature", 1.0))
 	ptr_scale = float(cfg.get("pointer_scale_init", 1.0))
 	ptr_learn = bool(cfg.get("learnable_pointer_scale", False))
 	ptr_use_norm = bool(cfg.get("pointer_use_norm", True))
-	# Mirror trainable_catalog from config if present
+	
 	trainable_cat_cfg = bool(cfg.get("trainable_catalog", False))
 	if trainable_cat_cfg:
 		args.trainable_catalog = True
@@ -311,16 +311,16 @@ def main() -> None:
 	model.eval()
 	_dbg(args.debug, "Model set to eval()")
 
-	# Conditioning defaults (zeros)
+	
 	currency = [args.currency]
 	je_type = [args.je_type]
 	_dbg(args.debug, f"Conditioning: currency={currency} je_type={je_type}")
 
-	# Retrieval memory default to small zeros
+	
 	retr_mem = torch.zeros((1, args.hidden_dim), dtype=torch.float32, device=device)
 	_dbg(args.debug, f"Retrieval memory initialized with shape={tuple(retr_mem.shape)}")
 
-	# Optional: print first-step logits to see if stop dominates
+	
 	if args.debug:
 		with torch.no_grad():
 			prev_acc0 = torch.full((1, model.max_lines), -1, dtype=torch.long, device=device)
@@ -343,7 +343,7 @@ def main() -> None:
 			_dbg(True if args.debug else False, f"step0 stop_probs={stop0.tolist()} side_probs={side0.tolist()}")
 			_dbg(True if args.debug else False, f"step0 pointer topk indices={topi.tolist()} probs={topv.tolist()}")
 
-	# Decode
+	
 	with torch.no_grad():
 		cands = beam_search_decode(
 			model=model,
@@ -362,7 +362,7 @@ def main() -> None:
 	_dbg(args.debug, f"beam candidates returned={len(cands) if cands else 0}")
 	if args.debug:
 		_dbg(True, f"{cands}")
-	# Fallback: if beam returns empty or length 0 and min-lines requested, force 1 line greedily
+	
 	if (not cands or (cands and cands[0].get("length", 0) == 0)) and int(args.min_lines) > 0:
 		print(f"[infer] fallback to min-lines={args.min_lines}")
 		with torch.no_grad():
@@ -384,7 +384,7 @@ def main() -> None:
 			acc_idx = int(torch.argmax(ptr0).item()) if ptr0.numel() > 0 else -1
 			side_idx = int(torch.argmax(side0).item()) if side0.numel() > 0 else 0
 			if acc_idx < 0:
-				# Fallback to first account if available
+				
 				if cat_emb.shape[0] > 0:
 					acc_idx = 0
 			if acc_idx >= 0:
@@ -394,7 +394,7 @@ def main() -> None:
 	if not cands:
 		print(json.dumps({"candidates": []}, indent=2))
 		return
-	# Print top-3
+	
 	top = cands[:3]
 	print(json.dumps({"candidates": top}, indent=2))
 

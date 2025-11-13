@@ -53,7 +53,7 @@ def infer(
     tau: float = 0.5,
     duplicate_policy: str = "collapse_unique_pairs",
     max_dup_per_account: Optional[int] = None,
-    # Optional retrieval artifacts
+    
     index_dir: Optional[str] = None,
     ids_uri: Optional[str] = None,
     embeddings_uri: Optional[str] = None,
@@ -90,7 +90,7 @@ def infer(
         device=device,
     )
 
-    # Beam search
+    
     cands = beam_search_decode(
         model=model,
         input_ids=input_ids,
@@ -146,7 +146,7 @@ def main():
     parser.add_argument("--tau", type=float, default=0.5)
     parser.add_argument("--duplicate-policy", type=str, default="collapse_unique_pairs", choices=["allow", "collapse_unique_pairs", "limit_per_account"])
     parser.add_argument("--max-dup-per-account", type=int, default=None)
-    # Optional retrieval artifacts
+    
     parser.add_argument("--index-dir", type=str, default=None)
     parser.add_argument("--ids-uri", type=str, default=None)
     parser.add_argument("--embeddings-uri", type=str, default=None)

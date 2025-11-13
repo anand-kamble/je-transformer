@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader, Subset
 from transformers import get_cosine_schedule_with_warmup
 
 
-# Ingestion is now handled by data/ingest_to_parquet.py (external step)
+
 from models.catalog_encoder import CatalogEncoder
 from models.je_model_torch import JEModel, mean_pool
 from models.losses import (SetF1Metric, coverage_penalty, flow_aux_loss,
@@ -63,7 +63,7 @@ def build_catalog_embeddings(artifact: Dict[str, Any], emb_dim: int, device: tor
     name = [a.get("name", "") for a in accounts]
     nature = [a.get("nature", "") for a in accounts]
     encoder = CatalogEncoder(emb_dim=emb_dim)
-    embs = encoder({"number": number, "name": name, "nature": nature})  # [C, emb_dim]
+    embs = encoder({"number": number, "name": name, "nature": nature})  
     return embs.to(device=device, dtype=torch.float32).detach()
 
 
@@ -88,7 +88,7 @@ def main() -> None:
         default=os.environ.get("OUTPUT_DIR", "./out_small"),
         help="Dir (or gs://) to write checkpoints (default: ./out_small or $OUTPUT_DIR)",
     )
-    # Optional: end-to-end ingestion (Cloud SQL -> Parquet on GCS) before training
+    
     parser.add_argument("--project", type=str, default=os.environ.get("GOOGLE_CLOUD_PROJECT"))
     parser.add_argument("--instance", type=str, default=os.environ.get("DB_INSTANCE_CONNECTION_NAME", "lb01-438216:us-central1:db-3-postgres"))
     parser.add_argument("--db", type=str, default=os.environ.get("DB_NAME", "liebre_dev"))
@@ -105,7 +105,7 @@ def main() -> None:
     parser.add_argument("--start-date", type=str, default=os.environ.get("START_DATE"))
     parser.add_argument("--end-date", type=str, default=os.environ.get("END_DATE"))
     parser.add_argument("--shard-size", type=int, default=int(os.environ.get("SHARD_SIZE", "2000")))
-    # Tiny defaults for quick runs
+    
     parser.add_argument("--encoder", type=str, default="prajjwal1/bert-tiny", help="Small HF encoder for speed")
     parser.add_argument("--max-length", type=int, default=64)
     parser.add_argument("--max-lines", type=int, default=40)
@@ -114,27 +114,27 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--flow-weight", type=float, default=0.01)
-    # Pointer/logit scaling and catalog options
+    
     parser.add_argument("--pointer-temp", type=float, default=0.5, help="Pointer softmax temperature (larger -> softer distribution)")
     parser.add_argument("--pointer-scale-init", type=float, default=5.0, help="Initial multiplicative scale for pointer logits")
     parser.add_argument("--learnable-pointer-scale", action="store_true", help="Make pointer logit scale learnable")
     parser.add_argument("--no-pointer-norm", action="store_true", help="Disable L2 normalization in pointer layer")
     parser.add_argument("--trainable-catalog", action="store_true", help="Make catalog embeddings trainable inside model")
-    # Flow warmup
+    
     parser.add_argument("--flow-warmup-epochs", type=int, default=3, help="Epochs to apply warmup multiplier to flow loss")
     parser.add_argument("--flow-warmup-multiplier", type=float, default=5.0, help="Multiplier for flow loss during warmup")
-    # Optimizer stability
+    
     parser.add_argument("--max-grad-norm", type=float, default=0.5, help="Gradient clipping max norm")
     parser.add_argument("--lr-warmup-epochs", type=int, default=2, help="Epochs for LR warmup in cosine schedule")
-    # Optional retrieval memory integration
+    
     parser.add_argument("--retrieval-index-dir", type=str, default=os.environ.get("RETRIEVAL_INDEX_DIR"), help="ScaNN index dir (gs://). Enables retrieval when provided")
     parser.add_argument("--retrieval-top-k", type=int, default=int(os.environ.get("RETRIEVAL_TOP_K", "5")))
     parser.add_argument("--retrieval-use-cls", action="store_true", help="Use [CLS] for pooling the query (defaults to mean pooling)")
-    # Training metrics/logging
+    
     parser.add_argument("--setf1-window-steps", type=int, default=100, help="Window size for training SetF1 metric")
     parser.add_argument("--early-stopping-patience", type=int, default=5, help="Epochs with no val/loss improvement before stopping (0=disable)")
     parser.add_argument("--log-hist-every", type=int, default=0, help="Log pointer logits histogram every N steps (0=disabled)")
-    # Validation/eval
+    
     parser.add_argument("--val-ratio", type=float, default=0.1, help="Fraction of training subset reserved for validation")
     parser.add_argument("--max-val-batches", type=int, default=0, help="Max validation batches per epoch (0=all)")
     parser.add_argument("--log-retrieval-heatmaps", action="store_true", help="Log retrieval fusion weight heatmaps to W&B")
@@ -151,11 +151,11 @@ def main() -> None:
     if args.seed:
         set_seed(int(args.seed))
 
-    # Generate unique run name/ID EARLY (before any file operations)
+    
     wandb_enabled = not args.no_wandb
     run_id: Optional[str] = None
     if wandb_enabled:
-        # Pre-generate run ID so we can use it for directory naming
+        
         try:
             import uuid
             run_id = uuid.uuid4().hex
@@ -163,24 +163,24 @@ def main() -> None:
             run_id = None
         run_name = args.wandb_name or run_id
     else:
-        # If wandb disabled, fallback to timestamp
+        
         import time
         run_name = time.strftime("%Y%m%d-%H%M%S")
-    # Ensure run_name is a non-empty string
+    
     if not run_name:
         import time as _time
         run_name = _time.strftime("%Y%m%d-%H%M%S")
     
-    # Update ALL output directories to use run_name
-    # 1. Update main output directory
+    
+    
     if not args.output_dir.startswith("gs://"):
         args.output_dir = os.path.join(args.output_dir, run_name)
         os.makedirs(args.output_dir, exist_ok=True)
     else:
-        # For GCS, append run_name to path
+        
         args.output_dir = f"{args.output_dir.rstrip('/')}/{run_name}"
     
-    # 2. Update ingestion output directory
+    
     if args.gcs_output_uri:
         if not args.gcs_output_uri.startswith("gs://"):
             args.gcs_output_uri = os.path.join(args.gcs_output_uri, run_name)
@@ -189,16 +189,15 @@ def main() -> None:
             args.gcs_output_uri = f"{args.gcs_output_uri.rstrip('/')}/{run_name}"
             
     def get_loss_weights(epoch, total_epochs):
-        """Progressive loss weighting schedule"""
         progress = epoch / total_epochs
         
-        # Reduce flow loss weight over time (starts high for structure)
+        
         flow_weight = args.flow_weight * (2.0 - progress)
         
-        # Increase coverage weight over time (for refinement)
+        
         coverage_weight = 0.01 * (1.0 + progress)
         
-        # Warmup stops after epoch 3
+        
         if epoch < 3:
             flow_warmup = args.flow_warmup_multiplier
         else:
@@ -210,7 +209,7 @@ def main() -> None:
         }
 
 
-    # Initialize wandb with the pre-generated run name/ID
+    
     if wandb_enabled:
         try:
             wandb.init(
@@ -242,18 +241,18 @@ def main() -> None:
                 },
                 job_type="training",
             )
-            # Verify run_name matches
+            
             _rn = getattr(wandb, "run", None)
             if _rn is not None and getattr(_rn, "name", None):
-                run_name = _rn.name  # type: ignore[assignment]
+                run_name = _rn.name  
             print(f"Initialized wandb run: {run_name}")
             print(f"All outputs will be saved to: {args.output_dir}")
 
-            # Define custom metrics for better visualization
+            
             wandb.define_metric("epoch")
             wandb.define_metric("train/*", step_metric="epoch")
             wandb.define_metric("val/*", step_metric="epoch")
-            # Summaries for key metrics
+            
             try:
                 wandb.define_metric("val/loss", summary="min")
                 wandb.define_metric("val/set_f1", summary="max")
@@ -268,18 +267,18 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu"))
 
 
-    # Upstream ingestion has moved to data/ingest_to_parquet.py.
-    # Expect prebuilt Parquet shards and accounts artifact via CLI.
+    
+    
     parquet_pattern = args.parquet_pattern
     accounts_artifact_path = args.accounts_artifact
 
 
-    # Dataset and small subset + validation split
+    
     full_ds = ParquetJEDataset(parquet_pattern, tokenizer_loc=args.encoder, max_length=args.max_length, max_lines=args.max_lines)
     n = len(full_ds)
     lim = max(1, min(int(args.limit), n))
     subset_indices: List[int] = list(range(lim))
-    # Deterministic shuffle for split
+    
     rng = np.random.RandomState(int(args.seed) if args.seed is not None else 0)
     rng.shuffle(subset_indices)
     val_count = int(max(1, round(float(args.val_ratio) * len(subset_indices)))) if args.val_ratio > 0 else 0
@@ -297,7 +296,7 @@ def main() -> None:
     catalog_size = cat_emb.size(0)
     
 
-    # Build journal_entry_id -> account set mapping for retrieval metrics (from full dataframe)
+    
     jeid_to_accountset: Dict[str, set] = {}
     try:
         df_local = full_ds.df
@@ -355,22 +354,22 @@ def main() -> None:
         use_pointer_norm=not args.no_pointer_norm,
         learn_catalog=bool(args.trainable_catalog),
     ).to(device)
-    # Optional: load retrieval artifacts once and pre-project embeddings to model hidden dim
+    
     retrieval_enabled = bool(args.retrieval_index_dir)
     _retr_searcher = None
-    _retr_proj_embs = None  # torch.Tensor on CPU [N, H_hidden]
+    _retr_proj_embs = None  
     _normalize_queries = True
-    _retr_index_ids: Optional[List[str]] = None  # aligned to index/embeddings
+    _retr_index_ids: Optional[List[str]] = None  
     if not retrieval_enabled:
         print("[retrieval] Disabled: --retrieval-index-dir not provided")
     if retrieval_enabled:
         try:
-            import scann  # type: ignore
+            import scann  
             import numpy as _np
-            # Helpers supporting gs:// and local
+            
             def _load_bytes(path: str) -> bytes:
                 if path.startswith("gs://"):
-                    from google.cloud import storage  # type: ignore
+                    from google.cloud import storage  
                     client = storage.Client()
                     _, p = path.split("gs://", 1)
                     bkt, blob_name = p.split("/", 1)
@@ -384,18 +383,18 @@ def main() -> None:
                 if not src.startswith("gs://"):
                     raise RuntimeError("Retrieval is GCS-only; --retrieval-index-dir must be a gs:// URI")
                 tmpdir = _tf.mkdtemp(prefix="scann_idx_")
-                from google.cloud import storage  # type: ignore
+                from google.cloud import storage  
                 client = storage.Client()
                 _, path = src.split("gs://", 1)
                 bucket_name, prefix = path.split("/", 1)
                 bucket = client.bucket(bucket_name)
                 print(f"[retrieval] Downloading ScaNN index from gs://{bucket_name}/{prefix.rstrip('/')}")
-                # Explicitly ensure required ScaNN files exist at the directory root
+                
                 required_files = [
                     "serialized_partitioner.pb",
                     "scann_config.pb",
                     "scann_assets.pbtxt",
-                    "ah_codebook.pb",  # required when score_ah() was used to build
+                    "ah_codebook.pb",  
                 ]
                 optional_files = ["dataset.npy", "hashed_dataset.npy", "datapoint_to_token.npy"]
                 for fname in required_files:
@@ -416,7 +415,7 @@ def main() -> None:
                     print(f"[retrieval]   downloaded '{fname}' to {local_path} ({sz} bytes)")
                     if _os.path.getsize(local_path) == 0:
                         raise RuntimeError(f"Downloaded zero-byte ScaNN file '{fname}' from {src}")
-                # Best-effort download of optional artifacts
+                
                 for fname in optional_files:
                     blob = bucket.blob(f"{prefix.rstrip('/')}/{fname}")
                     if blob.exists(client):
@@ -427,21 +426,21 @@ def main() -> None:
                         except Exception:
                             sz = -1
                         print(f"[retrieval]   downloaded optional '{fname}' ({sz} bytes)")
-                # Rewrite scann_assets.pbtxt to ensure relative paths (avoid serialized tmp paths)
+                
                 try:
                     assets_path = _os.path.join(tmpdir, "scann_assets.pbtxt")
                     if _os.path.exists(assets_path):
                         with open(assets_path, "r", encoding="utf-8") as af:
                             txt = af.read()
                         before = txt
-                        # Normalize any embedded absolute tmp paths to basenames
+                        
                         import re as _re
                         def _basename_repl(match):
                             path_str = match.group(1)
                             base = _os.path.basename(path_str)
                             return f"\"{base}\""
                         txt = _re.sub(r"\"(/tmp/[^\"]+)\"", _basename_repl, txt)
-                        # Also handle generic absolute paths by collapsing to basename
+                        
                         def _basename_repl_generic(match):
                             path_str = match.group(1)
                             if path_str.startswith("/"):
@@ -456,10 +455,10 @@ def main() -> None:
                 except Exception as e:
                     print(f"[retrieval] Warning: failed to rewrite scann_assets.pbtxt: {e}")
                 return tmpdir
-            # Load searcher and embeddings
+            
             print(f"[retrieval] Using retrieval index dir: {args.retrieval_index_dir}")
             _idx_dir_local = _download_scann_dir(args.retrieval_index_dir)
-            # Load ScaNN searcher directly from the directory
+            
             print(f"[retrieval] Loading ScaNN searcher from {_idx_dir_local} ...")
             try:
                 _retr_searcher = scann.scann_ops_pybind.load_searcher(_idx_dir_local)
@@ -478,7 +477,7 @@ def main() -> None:
                 except Exception as e_ls:
                     print(f"[retrieval] Failed to list local index dir: {e_ls}")
                 raise
-            # Try to read manifest for settings and file hints
+            
             manifest = None
             manifest_path = os.path.join(_idx_dir_local, "index_manifest.json")
             if os.path.exists(manifest_path):
@@ -489,7 +488,7 @@ def main() -> None:
                     print(f"[retrieval] Loaded manifest: {json.dumps(manifest, indent=2)[:500]}{'...' if len(json.dumps(manifest))>500 else ''}")
                 except Exception:
                     print("[retrieval] Loaded manifest (printing skipped due to size/encoding)")
-            # Locate embeddings under the index dir (manifest → embeddings.npy → dataset.npy)
+            
             emb_np = None
             candidates: List[str] = []
             ids_rel = None
@@ -512,7 +511,7 @@ def main() -> None:
                     break
             if emb_np is None:
                 raise RuntimeError("Could not locate retrieval embeddings (tried manifest → embeddings.npy → dataset.npy).")
-            # Load ids aligned to embeddings/index if available
+            
             _ids_path = os.path.join(_idx_dir_local, "ids.txt")
             if os.path.exists(_ids_path):
                 with open(_ids_path, "r", encoding="utf-8") as f:
@@ -526,16 +525,16 @@ def main() -> None:
                     print(f"[retrieval] Loaded ids via manifest path with {len(_retr_index_ids)} ids")
             else:
                 print("[retrieval] Warning: ids.txt not found; retrieval metrics will be limited")
-            # Project to hidden_dim using the model's enc_proj and tanh, on CPU and no grad
+            
             with torch.no_grad():
-                emb_t = torch.tensor(emb_np, dtype=torch.float32)  # CPU
-                proj = torch.tanh(model.enc_proj(emb_t.to(device=model.enc_proj.weight.device)))  # [N, H_hidden] on model device
-                _retr_proj_embs = proj.detach().cpu()  # keep on CPU, move to device per batch
+                emb_t = torch.tensor(emb_np, dtype=torch.float32)  
+                proj = torch.tanh(model.enc_proj(emb_t.to(device=model.enc_proj.weight.device)))  
+                _retr_proj_embs = proj.detach().cpu()  
             print(f"[retrieval] Loaded. proj_embeddings={tuple(_retr_proj_embs.shape)}, top_k={int(args.retrieval_top_k)}, normalize_queries={_normalize_queries}")
         except Exception as e:
             print(f"Warning: retrieval disabled due to load error: {e}")
             retrieval_enabled = False
-    # Small helper to build retrieval memory per batch
+    
     def _build_retrieval_memory_batch(_inp_ids: torch.Tensor, _attn: torch.Tensor) -> Optional[torch.Tensor]:
         if not retrieval_enabled:
             return None
@@ -550,11 +549,11 @@ def main() -> None:
             mem_list = []
             for i in range(len(nbrs)):
                 idx_tensor = torch.tensor(nbrs[i], dtype=torch.long)
-                mem_i = _retr_proj_embs.index_select(0, idx_tensor)  # [K, H]
+                mem_i = _retr_proj_embs.index_select(0, idx_tensor)  
                 mem_list.append(mem_i)
-            mem = torch.stack(mem_list, dim=0).to(device)  # [B, K, H]
+            mem = torch.stack(mem_list, dim=0).to(device)  
         return mem
-    # Helper for validation: return both neighbor indices and retrieval memory
+    
     def _neighbors_and_memory_batch(_inp_ids: torch.Tensor, _attn: torch.Tensor) -> Optional[tuple]:
         if not retrieval_enabled:
             return None
@@ -569,13 +568,12 @@ def main() -> None:
             mem_list = []
             for i in range(len(nbrs)):
                 idx_tensor = torch.tensor(nbrs[i], dtype=torch.long)
-                mem_i = _retr_proj_embs.index_select(0, idx_tensor)  # [K, H]
+                mem_i = _retr_proj_embs.index_select(0, idx_tensor)  
                 mem_list.append(mem_i)
-            mem = torch.stack(mem_list, dim=0).to(device)  # [B, K, H]
+            mem = torch.stack(mem_list, dim=0).to(device)  
             return nbrs, mem
         return None
     def clip_grad_by_component(model, max_norm):
-        """Clip gradients for pointer, side, stop heads separately"""
         param_groups = {
             'pointer': [p for n, p in model.named_parameters() 
                     if 'pointer' in n and p.grad is not None],
@@ -596,7 +594,7 @@ def main() -> None:
         except Exception as e:
             print(f"Warning: failed to register trainable catalog embeddings: {e}")
     
-    # Gradient watching removed to reduce logging noise
+    
             
     pointer_params = [p for n, p in model.named_parameters() if 'pointer' in n]
     other_params = [p for n, p in model.named_parameters() if 'pointer' not in n]
@@ -605,10 +603,10 @@ def main() -> None:
     
     optimizer = torch.optim.AdamW([
         {'params': other_params, 'lr': args.lr},
-        {'params': pointer_params, 'lr': args.lr * 0.5}  # Lower LR for pointer
+        {'params': pointer_params, 'lr': args.lr * 0.5}  
     ], lr=args.lr)
 
-    # Scheduler with warmup over epochs
+    
     total_steps = max(1, len(dl) * int(args.epochs))
     try:
         warmup_steps = int(len(dl) * int(args.lr_warmup_epochs))
@@ -626,9 +624,9 @@ def main() -> None:
     best_val_loss = float("inf")
     epochs_since_improvement = 0
     for epoch in range(args.epochs):
-        # Track last metrics from epoch for checkpoint
+        
         last_metrics = None
-        # Training epoch accumulators (averaged at epoch end)
+        
         epoch_train_examples = 0
         train_total_sum = 0.0
         train_pl_sum = 0.0
@@ -654,7 +652,7 @@ def main() -> None:
             credit_indices = targets["credit_indices"].to(device)
             credit_weights = targets["credit_weights"].to(device)
             
-            # inside the training loop, once per N steps:
+            
             with torch.no_grad():
                 m = (target_account_idx >= 0)
                 if m.any():
@@ -665,7 +663,7 @@ def main() -> None:
 
 
             optimizer.zero_grad(set_to_none=True)
-            # Optional retrieval memory
+            
             retr_mem = _build_retrieval_memory_batch(input_ids, attention_mask) if retrieval_enabled else None
             outputs = model(
                 input_ids=input_ids,
@@ -679,20 +677,20 @@ def main() -> None:
                 journal_entry_type=journal_entry_type,
             )
             
-            # Compute softmax ONCE
+            
             pointer_probs = torch.softmax(outputs["pointer_logits"], dim=-1)
             side_probs = torch.softmax(outputs["side_logits"], dim=-1)
             
-            # Raw (unnormalized) cross-entropies removed from logging
+            
 
-            # Pass probabilities instead of logits where applicable
+            
             pl = pointer_loss(outputs["pointer_logits"], target_account_idx, ignore_index=-1)
             sl = side_loss(outputs["side_logits"], target_side_id, ignore_index=-1)
             stl = stop_loss(outputs["stop_logits"], target_stop_id, ignore_index=-1)
 
-            # These use the pre-computed probabilities
+            
             cov = coverage_penalty(outputs["pointer_logits"], probs=pointer_probs)
-            # Raw flow auxiliary loss (weights applied via get_loss_weights)
+            
             flow = flow_aux_loss(
                 outputs["pointer_logits"],
                 outputs["side_logits"],
@@ -705,7 +703,7 @@ def main() -> None:
             )
 
             loss_weights = get_loss_weights(epoch, args.epochs)
-            # Balanced multi-task loss: normalized primary components + scheduled aux terms
+            
             total = (
                 pl
                 + sl
@@ -713,7 +711,7 @@ def main() -> None:
                 + cov * loss_weights['coverage']
                 + flow * loss_weights['flow']
             )
-            # NaN/Inf guards
+            
             def _finite(x: torch.Tensor) -> bool:
                 try:
                     return bool(torch.isfinite(x).all())
@@ -724,7 +722,7 @@ def main() -> None:
                 print("[anomaly] Non-finite loss component detected; skipping optimizer step.")
                 optimizer.zero_grad(set_to_none=True)
                 continue
-            # Accumulate training loss components for epoch averages
+            
             try:
                 B = int(input_ids.size(0))
             except Exception:
@@ -734,12 +732,12 @@ def main() -> None:
             train_pl_sum += float(pl.item()) * B
             train_sl_sum += float(sl.item()) * B
             train_stl_sum += float(stl.item()) * B
-            total.backward()  # No retain_graph needed!
+            total.backward()  
             clip_grad_by_component(model, max_norm=1.0)  
             optimizer.step()
             scheduler.step()
             
-            # Update SetF1 every step (windowed); will be logged and reset periodically
+            
             metric_set_f1.update_state(
                 outputs["pointer_logits"].detach().cpu(),
                 outputs["side_logits"].detach().cpu(),
@@ -748,7 +746,7 @@ def main() -> None:
                 target_stop_id.detach().cpu(),
             )
             
-            # Store last metrics for checkpoint
+            
             last_metrics = {
                 "loss": total.item(),
                 "pointer_loss": pl.item(),
@@ -760,9 +758,9 @@ def main() -> None:
             }
 
 
-            # Windowed SetF1 rolls automatically; no manual reset
+            
         
-        # Compute training epoch averages
+        
         train_ex_den = float(max(epoch_train_examples, 1))
         train_logs = {
             "epoch": epoch,
@@ -772,18 +770,18 @@ def main() -> None:
             "train/stop_loss": (train_stl_sum / train_ex_den),
         }
 
-        # End-of-epoch validation
+        
         if dl_val is not None:
             model.eval()
             val_steps_done = 0
-            # Aggregation by examples and tokens
+            
             val_examples = 0
             val_total_sum = 0.0
             val_pl_sum = 0.0
             val_sl_sum = 0.0
             val_stl_sum = 0.0
             val_metric = SetF1Metric()
-            # Retrieval metrics aggregation buffers
+            
             retr_query_ids: List[str] = []
             retr_topk_indices: List[List[int]] = []
             first_heatmaps_logged = False
@@ -803,7 +801,7 @@ def main() -> None:
                     deb_w_v = v_targets["debit_weights"].to(device)
                     cre_idx_v = v_targets["credit_indices"].to(device)
                     cre_w_v = v_targets["credit_weights"].to(device)
-                    # Build retrieval memory and also get neighbor indices if enabled
+                    
                     retr_mem_v = None
                     nbrs_v = None
                     if retrieval_enabled:
@@ -838,7 +836,7 @@ def main() -> None:
                         pointer_probs=pp_v,
                         side_probs=sp_v,
                     )
-                    # Apply same weights as training (no extra normalization)
+                    
                     loss_weights_v = get_loss_weights(epoch, args.epochs)
                     total_v = (
                         pl_v
@@ -847,14 +845,14 @@ def main() -> None:
                         + cov_v * loss_weights_v['coverage']
                         + flow_v * loss_weights_v['flow']
                     )
-                    # Aggregations
+                    
                     Bv = int(input_ids_v.size(0))
                     val_examples += Bv
                     val_total_sum += float(total_v.item()) * Bv
                     val_pl_sum += float(pl_v.item()) * Bv
                     val_sl_sum += float(sl_v.item()) * Bv
                     val_stl_sum += float(stl_v.item()) * Bv
-                    # token-level validity counts removed (unused)
+                    
                     val_metric.update_state(
                         outs_v["pointer_logits"].detach().cpu(),
                         outs_v["side_logits"].detach().cpu(),
@@ -862,47 +860,47 @@ def main() -> None:
                         tgt_side_v.detach().cpu(),
                         tgt_stop_v.detach().cpu(),
                     )
-                    # Accumulate retrieval neighbors and query ids for metrics
+                    
                     if retrieval_enabled and nbrs_v is not None:
                         retr_topk_indices.extend([list(x) for x in nbrs_v])
                         qids_batch = [str(x) for x in v_features.get("journal_entry_id", [""] * len(nbrs_v))]
                         retr_query_ids.extend(qids_batch)
-                    # Log heatmaps once
-                    # if (
-                    #     retrieval_enabled
-                    #     and args.log_retrieval_heatmaps
-                    #     and not first_heatmaps_logged
-                    #     and "retrieval_weights" in outs_v
-                    # ):
-                        # try:
-                        #     rw = outs_v["retrieval_weights"].detach().cpu().numpy()  # [B, T, K]
-                        #     import numpy as _npimg
-                        #     images = []
-                        #     max_items = min(int(args.eval_samples), rw.shape[0])
-                        #     # If we have neighbor ranks, use them for captions
-                        #     nbrs_for_caption = nbrs_v if nbrs_v is not None else [[] for _ in range(rw.shape[0])]
-                        #     for i in range(max_items):
-                        #         mat = rw[i]  # [T, K]
-                        #         # Normalize to 0..255 for visualization
-                        #         mn = float(mat.min()) if mat.size else 0.0
-                        #         mx = float(mat.max()) if mat.size else 1.0
-                        #         den = (mx - mn) if (mx - mn) > 1e-8 else 1.0
-                        #         img = ((mat - mn) / den * 255.0).astype(_npimg.uint8)
-                        #         # Build caption from neighbor ids if available
-                        #         cap = ""
-                        #         if _retr_index_ids is not None and len(nbrs_for_caption) > i:
-                        #             nids = [(_retr_index_ids[j] if 0 <= j < len(_retr_index_ids) else "") for j in nbrs_for_caption[i]]
-                        #             cap = f"neighbors: {', '.join(nids[:5])}"
-                        #         images.append(wandb.Image(img, caption=cap))
-                        #     if images and wandb_enabled:
-                        #         wandb.log({"retrieval/heatmaps": images})
-                        #     first_heatmaps_logged = True
-                        # except Exception as _img_e:
-                        #     print(f"[wandb] Warning: failed logging retrieval heatmaps: {_img_e}")
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
                     val_steps_done += 1
                     if int(args.max_val_batches) > 0 and val_steps_done >= int(args.max_val_batches):
                         break
-            # Finalize val metrics
+            
             ex_den = float(max(val_examples, 1))
             val_logs = {
                 "epoch": epoch,
@@ -912,7 +910,7 @@ def main() -> None:
                 "val/stop_loss": val_stl_sum / ex_den,
                 "val/set_f1": float(val_metric.result().item()) if hasattr(val_metric, "result") else 0.0,
             }
-            # Log combined train/val metrics once per epoch
+            
             if wandb_enabled:
                 try:
                     _combined_logs = dict(train_logs)
@@ -920,18 +918,18 @@ def main() -> None:
                     wandb.log(_combined_logs)
                 except Exception as _vlog_e:
                     print(f"[wandb] Warning: failed logging epoch metrics: {_vlog_e}")
-            # Retrieval quality metrics logging removed by cleanup
-            # Selection and checkpointing by val/loss
+            
+            
             current_selection_loss = float(val_logs["val/loss"])
             if current_selection_loss < best_val_loss:
                 best_val_loss = current_selection_loss
                 best_epoch = epoch + 1
                 best_metrics = dict(val_logs)
                 with tempfile.TemporaryDirectory() as tmpdir:
-                    # 1. Save model_state.pt (for inference)
+                    
                     model_state_path = os.path.join(tmpdir, "model_state.pt")
                     torch.save({"model": model.state_dict()}, model_state_path)
-                    # 2. Save model config
+                    
                     config_path = os.path.join(tmpdir, "config.json")
                     with open(config_path, "w") as f:
                         json.dump({
@@ -948,12 +946,12 @@ def main() -> None:
                             "retrieval_top_k": int(args.retrieval_top_k),
                             "retrieval_use_cls": bool(args.retrieval_use_cls),
                         }, f, indent=2)
-                    # 3. Save accounts artifact
+                    
                     accounts_path = os.path.join(tmpdir, "accounts_artifact.json")
                     artifact_data = load_json_from_uri(accounts_artifact_path)
                     with open(accounts_path, "w", encoding="utf-8") as f:
                         json.dump(artifact_data, f, indent=2, ensure_ascii=False)
-                    # 3.5. Save catalog embeddings used by the model (trained param if enabled, else static)
+                    
                     catalog_emb_path = os.path.join(tmpdir, "catalog_embeddings.pt")
                     try:
                         cat_src = (
@@ -964,7 +962,7 @@ def main() -> None:
                         torch.save({"catalog_embeddings": cat_src}, catalog_emb_path)
                     except Exception as _ce_save_e:
                         print(f"Warning: failed to save catalog embeddings: {_ce_save_e}")
-                    # 4. Save training metadata
+                    
                     metadata_path = os.path.join(tmpdir, "training_metadata.json")
                     with open(metadata_path, "w") as f:
                         json.dump({
@@ -1003,9 +1001,9 @@ def main() -> None:
                             },
                         }, f, indent=2)
 
-                    # Do not upload W&B artifacts (disabled by cleanup)
+                    
 
-                    # Save best files to output dir (local or GCS)
+                    
                     if args.output_dir.startswith("gs://"):
                         from google.cloud import storage
                         client = storage.Client()
@@ -1036,9 +1034,9 @@ def main() -> None:
                 epochs_since_improvement += 1
             model.train()
 
-        # If no validation loader exists, fall back to training-loss selection
+        
         if dl_val is None:
-            # Log training metrics once per epoch
+            
             if wandb_enabled:
                 try:
                     wandb.log(train_logs)
@@ -1060,7 +1058,7 @@ def main() -> None:
                 best_epoch = epoch + 1
                 best_metrics = dict(last_metrics)
                 with tempfile.TemporaryDirectory() as tmpdir:
-                    # Save model, config, accounts, catalog embeddings, metadata
+                    
                     model_state_path = os.path.join(tmpdir, "model_state.pt")
                     torch.save({"model": model.state_dict()}, model_state_path)
                     config_path = os.path.join(tmpdir, "config.json")
@@ -1127,7 +1125,7 @@ def main() -> None:
                             },
                             "metrics": best_metrics,
                         }, f, indent=2)
-                    # Do not upload W&B artifacts (disabled by cleanup)
+                    
                     if args.output_dir.startswith("gs://"):
                         from google.cloud import storage
                         client = storage.Client()
@@ -1153,15 +1151,15 @@ def main() -> None:
                         ]:
                             shutil.copy2(fpath, os.path.join(args.output_dir, fname))
                         print(f"New best (epoch {best_epoch}, loss={best_loss:.4f}) saved to {args.output_dir}")
-        # Early stopping check (only with validation and patience > 0)
+        
         if dl_val is not None and int(args.early_stopping_patience) > 0:
             if epochs_since_improvement >= int(args.early_stopping_patience):
                 print(f"Early stopping: no val/loss improvement for {epochs_since_improvement} epochs at epoch {epoch+1}.")
                 break
 
-    # Only the best checkpoint is saved during training; nothing else to do here.
     
-    # Log final summary to wandb
+    
+    
     if wandb_enabled:
         try:
             wandb.summary.update({

@@ -1,9 +1,0 @@
-The performance of a retrieval transformer's retrieval component is typically evaluated using standard information retrieval (IR) metrics. These metrics assess the relevance and ranking quality of the retrieved information against a "ground truth" set of relevant documents or facts. 
-Key metrics include:
-Precision@k: Measures the fraction of retrieved documents within the top k results that are relevant to the query. It focuses on the accuracy of the top-ranked items.
-Recall@k: Assesses the proportion of all available relevant documents in the dataset that were successfully retrieved within the top k results. It measures coverage of relevant information.
-Mean Reciprocal Rank (MRR): Evaluates the ranking quality by averaging the reciprocal of the rank of the first relevant document across many queries. A higher MRR means relevant results appear earlier in the list.
-Normalized Discounted Cumulative Gain (NDCG@k): A sophisticated metric that considers the graded relevance of documents (not just binary relevant/non-relevant) and assigns higher value to highly relevant documents that appear at the top of the ranked list. This is a very common metric for evaluating ranking systems.
-Mean Average Precision (mAP): Calculates the average of precision scores at each rank where a new relevant document is found, averaged over all queries. It provides a single number summary of the ranking performance across different recall levels.
-Context Precision & Context Recall: These are specific metrics used in the evaluation of Retrieval-Augmented Generation (RAG) systems to measure the quality and sufficiency of the context fetched by the retriever component. 
-For the overall RAG system (retrieval + generation), additional metrics are used to evaluate the final generated answer, such as faithfulness (is the answer grounded in the retrieved context?), answer relevance, and hallucination rate

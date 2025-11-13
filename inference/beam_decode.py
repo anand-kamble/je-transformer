@@ -42,7 +42,7 @@ def beam_search_decode(
     max_lines: int = 8,
     topk_accounts: Optional[int] = None,
     tau: Optional[float] = None,
-    # Optional retrieval artifacts to auto-build memory when not provided
+    
     query_text: Optional[str] = None,
     index_dir: Optional[str] = None,
     ids_uri: Optional[str] = None,
@@ -101,20 +101,20 @@ def beam_search_decode(
                     currency=currency,
                     journal_entry_type=journal_entry_type,
                 )
-            ptr_logits = outputs["pointer_logits"][0, t, :].detach().cpu().numpy()  # [C]
-            side_logits = outputs["side_logits"][0, t, :].detach().cpu().numpy()   # [2]
-            stop_logits = outputs["stop_logits"][0, t, :].detach().cpu().numpy()   # [2]
+            ptr_logits = outputs["pointer_logits"][0, t, :].detach().cpu().numpy()  
+            side_logits = outputs["side_logits"][0, t, :].detach().cpu().numpy()   
+            stop_logits = outputs["stop_logits"][0, t, :].detach().cpu().numpy()   
 
-            # Log-softmax
+            
             ptr_logp = ptr_logits - np.logaddexp.reduce(ptr_logits)
             side_logp = side_logits - np.logaddexp.reduce(side_logits)
             stop_logp = stop_logits - np.logaddexp.reduce(stop_logits)
 
-            # Option 1: stop here
+            
             stop_lp = float(stop_logp[1])
             new_beams.append(BeamState(accounts=b.accounts.copy(), sides=b.sides.copy(), logprob=b.logprob + stop_lp, finished=True))
 
-            # Option 2: continue
+            
             cont_lp = float(stop_logp[0])
             top_idx = np.argpartition(-ptr_logp, range(topk_accounts))[:topk_accounts]
             top_idx = top_idx[np.argsort(-ptr_logp[top_idx])]

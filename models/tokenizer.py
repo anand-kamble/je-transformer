@@ -8,11 +8,6 @@ from data.text_normalization import normalize_batch
 
 
 class DescriptionTokenizer:
-    """
-    Wrapper around a pretrained HuggingFace tokenizer (default: bert-base-multilingual-cased)
-    with light normalization suitable for accounting descriptions.
-    """
-
     def __init__(
         self,
         model_name_or_path: str = "bert-base-multilingual-cased",
@@ -20,7 +15,7 @@ class DescriptionTokenizer:
         use_fast: bool = False,
     ) -> None:
         from transformers import \
-            AutoTokenizer  # defer import to avoid tooling stub issues
+            AutoTokenizer  
 
         self.model_name_or_path = model_name_or_path
         self.max_length = int(max_length)
@@ -44,15 +39,11 @@ class DescriptionTokenizer:
         return out
 
     def save_to_gcs(self, gcs_dir: str) -> str:
-        """
-        Saves tokenizer artifacts to a GCS directory (e.g., gs://bucket/path/tokenizer).
-        Returns the GCS directory used.
-        """
         if not gcs_dir.startswith("gs://"):
             raise ValueError("gcs_dir must start with gs://")
 
         from google.cloud import \
-            storage  # local import to minimize global deps
+            storage  
 
         with tempfile.TemporaryDirectory() as tmpdir:
             self.tokenizer.save_pretrained(tmpdir)
@@ -68,12 +59,9 @@ class DescriptionTokenizer:
 
     @classmethod
     def from_gcs_or_model(cls, location: str, max_length: int = 128) -> "DescriptionTokenizer":
-        """
-        If `location` is a GCS dir, download to temp and load; otherwise treat as HF model name/path.
-        """
         if location.startswith("gs://"):
-            from google.cloud import storage  # local import
-            from transformers import AutoTokenizer  # local import
+            from google.cloud import storage  
+            from transformers import AutoTokenizer  
 
             client = storage.Client()
             _, path = location.split("gs://", 1)
@@ -95,7 +83,7 @@ class DescriptionTokenizer:
                 obj.tokenizer = tok
                 return obj
             finally:
-                # Leave tmpdir until process end; cleanup handled by OS/container lifecycle.
+                
                 pass
         else:
             return cls(model_name_or_path=location, max_length=max_length)

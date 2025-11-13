@@ -127,7 +127,7 @@ def main():
 		currency = [str(ex.get("currency", ""))]
 		je_type = [str(ex.get("journal_entry_type", ""))]
 
-		# Targets sequence for token metrics
+		
 		debits = [int(i) for i in (ex.get("debit_accounts", []) or []) if int(i) >= 0]
 		credits = [int(i) for i in (ex.get("credit_accounts", []) or []) if int(i) >= 0]
 		tgt_seq = debits + credits
@@ -193,7 +193,7 @@ def main():
 
 		count += 1
 
-	# Calibration
+	
 	ece_raw = ece(seq_probs, seq_correct, num_bins=15)
 	best_T, best_ece = tune_temperature(seq_probs, seq_correct, grid=[0.5, 0.75, 1.0, 1.25, 1.5, 2.0])
 

@@ -32,14 +32,6 @@ def aggregate_retrieval_metrics(
 	index_ids: Sequence[str],
 	jeid_to_accountset: Dict[str, Set[int]],
 ) -> Dict[str, float]:
-	"""
-	Computes retrieval metrics based on Jaccard overlap of account sets.
-	- avg_jaccard@K: mean Jaccard across all queries and their top-K neighbors
-	- top1_jaccard: mean Jaccard of rank-1 neighbors
-	- hit_rate@K: fraction of queries with any Jaccard > 0 among top-K
-	- mrr: mean reciprocal rank where first Jaccard > 0
-	- context_precision@K / context_recall@K using union of neighbor sets
-	"""
 	total_top1 = 0.0
 	total_avg = 0.0
 	total_queries = 0

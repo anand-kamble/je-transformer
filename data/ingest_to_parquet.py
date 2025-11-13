@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 from __future__ import annotations
 
 import argparse
@@ -20,20 +20,20 @@ from sqlalchemy import (Boolean, Column, DateTime, Integer, Numeric, String,
                         Table, Text)
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 
-# ----------------- Simple debug helpers -----------------
+
 
 def _mask_secret(value: Optional[str]) -> str:
     if not value:
         return "None"
     return "********"
 
-# ----------------- DB engine via local PostgresConnection -----------------
 
-# Ensure local import path for psql_connection when running as a script
+
+
 _CURRENT_DIR = Path(__file__).resolve().parent
 if str(_CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(_CURRENT_DIR))
-from psql_connection import PostgresConnection  # noqa: E402
+from psql_connection import PostgresConnection  
 
 
 def create_engine_with_psql(
@@ -41,7 +41,7 @@ def create_engine_with_psql(
     db_user: Optional[str],
     db_password: Optional[str],
 ) -> sa.Engine:
-    # Allow overriding credentials via environment for PostgresConnection
+    
     if db_user:
         os.environ["DB_USER"] = db_user
     if db_password:
@@ -52,7 +52,7 @@ def create_engine_with_psql(
     return engine
 
 
-# ----------------- Schema (Core Tables) -----------------
+
 
 def reflect_or_define_tables(
     metadata: sa.MetaData,
@@ -149,7 +149,7 @@ def reflect_or_define_tables(
     return {"journal_entry": journal_entry, "entry_line": entry_line, "ledger_account": ledger_account}
 
 
-# ----------------- Secrets helpers -----------------
+
 
 def access_secret(project_id: Optional[str], secret_name: Optional[str], version: str = "latest") -> Optional[str]:
     if not secret_name:
@@ -165,7 +165,7 @@ def access_secret(project_id: Optional[str], secret_name: Optional[str], version
     return response.payload.data.decode("utf-8")
 
 
-# ----------------- Utility functions -----------------
+
 
 def date_features(dt: datetime.datetime) -> Dict[str, Any]:
     d = dt.date()
@@ -174,7 +174,7 @@ def date_features(dt: datetime.datetime) -> Dict[str, Any]:
     day = d.day
     dow = d.weekday()
     month_angle = 2.0 * math.pi * (month / 12.0)
-    # Approximate day angle over 31 bucket
+    
     day_angle = 2.0 * math.pi * (day / 31.0)
     return {
         "date_year": year,
@@ -235,7 +235,7 @@ class AccountCatalog:
         return AccountCatalog(id_to_index=id_to_index, rows=rows)
 
     def to_artifact(self) -> Dict[str, Any]:
-        # Debug print for serialization
+        
         print(f"[ingest] Serializing account catalog (num_accounts={len(self.rows)})")
         return {
             "generated_at": int(time.time()),
@@ -244,7 +244,7 @@ class AccountCatalog:
         }
 
 
-# ----------------- GCS helpers -----------------
+
 
 def write_gcs_json(gcs_uri: str, data: Dict[str, Any], client: storage.Client) -> None:
     if not gcs_uri.startswith("gs://"):
@@ -256,7 +256,7 @@ def write_gcs_json(gcs_uri: str, data: Dict[str, Any], client: storage.Client) -
     blob.upload_from_string(json.dumps(data, ensure_ascii=False, indent=2), content_type="application/json")
 
 
-# ----------------- Ingestion core -----------------
+
 
 def build_join_statement(
     tables: Dict[str, Table],
@@ -319,7 +319,7 @@ def write_parquet_shards(
     if not gcs_output_uri.startswith("gs://"):
         raise ValueError("gcs_output_uri must start with gs://")
 
-    # Prepare output paths
+    
     base_prefix = gcs_output_uri.rstrip("/")
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     shard_index = 0
@@ -357,7 +357,7 @@ def write_parquet_shards(
         nonlocal shard_index, shard_records, records_written, current_rows
         if current_je_id is None:
             return
-        # print(f"[ingest] Flushing JE {current_je.get('journal_entry_id')} (rows_in_shard={len(current_rows)}, shard_index={shard_index})")
+        
         row = {
             "journal_entry_id": current_je.get("journal_entry_id"),
             "business_id": current_je.get("business_id"),
@@ -366,7 +366,7 @@ def write_parquet_shards(
             "journal_entry_type": current_je.get("journal_entry_type", ""),
         }
         row.update(date_features(current_je["date"]))
-        # Targets
+        
         deb_idxs = [int(x) for x in debit_accounts]
         cre_idxs = [int(x) for x in credit_accounts]
         row["debit_accounts"] = deb_idxs
@@ -377,7 +377,7 @@ def write_parquet_shards(
         records_written += 1
         shard_records += 1
         if shard_records >= shard_size:
-            # write shard
+            
             out_path = make_shard_path(shard_index)
             _write_rows_parquet(current_rows, out_path)
             print(f"[ingest] Shard written: {out_path} (records_in_shard={shard_records}, total_records={records_written})")
@@ -401,7 +401,7 @@ def write_parquet_shards(
             }
         if je_id != current_je_id:
             flush_current()
-            # reset
+            
             current_je_id = je_id
             debit_accounts, credit_accounts = [], []
             debit_amounts, credit_amounts = [], []
@@ -430,7 +430,7 @@ def write_parquet_shards(
             credit_accounts.append(int(idx))
             credit_amounts.append(credit_val)
 
-    # flush last
+    
     flush_current()
     if current_rows:
         out_path = make_shard_path(shard_index)
@@ -451,9 +451,9 @@ def write_parquet_shards(
 
 
 def _write_rows_parquet(rows: List[Dict[str, Any]], gcs_uri: str) -> None:
-    # Use pandas+pyarrow which supports list columns
+    
     df = pd.DataFrame(rows)
-    # Ensure list-like columns are objects to be handled by pyarrow
+    
     for col in ("debit_accounts", "credit_accounts", "debit_amounts_norm", "credit_amounts_norm"):
         if col in df.columns:
             df[col] = df[col].apply(lambda x: list(x) if isinstance(x, Iterable) and not isinstance(x, (str, bytes)) else [])
@@ -467,7 +467,7 @@ def parse_date(s: Optional[str]) -> Optional[datetime.date]:
     return datetime.date.fromisoformat(s)
 
 
-# ----------------- Main CLI -----------------
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Ingest from Cloud SQL and write Parquet shards to GCS.")
@@ -489,7 +489,7 @@ def main() -> None:
     parser.add_argument("--db-schema", type=str, default="public")
     args = parser.parse_args()
 
-    # Resolve secrets
+    
     db_user = access_secret(args.secrets_project, args.db_user_secret) or args.db_user
     db_password = access_secret(args.secrets_project, args.db_password_secret) or args.db_password
     gcs_output = access_secret(args.secrets_project, args.gcs_output_uri_secret) or args.gcs_output_uri
@@ -510,7 +510,7 @@ def main() -> None:
     metadata = sa.MetaData()
     tables = reflect_or_define_tables(metadata, engine=engine, schema=args.db_schema or "public")
 
-    # Preflight: verify required tables exist in the specified schema
+    
     inspector = sa.inspect(engine)
     required_names = {
         "journal_entry": os.environ.get("JOURNAL_ENTRY_TABLE", "journal_entry"),
@@ -529,7 +529,7 @@ def main() -> None:
         )
 
     with engine.connect() as conn:
-        # Build account catalog snapshot
+        
         print("[ingest] Building accounts artifact and writing Parquet shards")
         catalog = AccountCatalog.build(conn, tables, business_id=args.business_id)
         client = storage.Client()

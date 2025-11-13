@@ -8,13 +8,6 @@ import torch.nn.functional as F
 
 
 def masked_sparse_ce(logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
-    """
-    Compute sparse CE over last dimension of logits with mask where targets == ignore_index.
-    Shapes:
-      - logits: [B, T, V]
-      - targets: [B, T]
-    Returns mean loss over non-ignored positions.
-    """
     if logits.dim() != 3:
         raise ValueError("logits must be [B, T, V]")
     if targets.dim() != 2:
@@ -24,22 +17,18 @@ def masked_sparse_ce(logits: torch.Tensor, targets: torch.Tensor, ignore_index: 
     targets_1d = targets.reshape(B * T)
     mask = (targets_1d != ignore_index).to(logits_2d.dtype)
     safe_targets = torch.where(mask > 0.5, targets_1d, torch.zeros_like(targets_1d))
-    # Per-position CE
-    ce = F.cross_entropy(logits_2d, safe_targets, reduction="none")  # [B*T]
+    
+    ce = F.cross_entropy(logits_2d, safe_targets, reduction="none")  
     ce = ce * mask
     denom = torch.clamp(mask.sum(), min=1.0)
     return ce.sum() / denom
 
 def adaptive_loss_scale(loss: torch.Tensor, momentum: float = 0.99) -> torch.Tensor:
-    """
-    Normalize loss by its running standard deviation to reduce variance.
-    Based on research showing variance regularization improves stability.
-    """
     if not hasattr(adaptive_loss_scale, 'running_mean'):
         adaptive_loss_scale.running_mean = 0.0
         adaptive_loss_scale.running_var = 1.0
     
-    # Update running statistics
+    
     loss_val = loss.detach().item()
     adaptive_loss_scale.running_mean = (
         momentum * adaptive_loss_scale.running_mean + (1 - momentum) * loss_val
@@ -49,7 +38,7 @@ def adaptive_loss_scale(loss: torch.Tensor, momentum: float = 0.99) -> torch.Ten
         (1 - momentum) * (loss_val - adaptive_loss_scale.running_mean) ** 2
     )
     
-    # Normalize by running std (with floor to prevent division by zero)
+    
     running_std = torch.sqrt(torch.tensor(adaptive_loss_scale.running_var + 1e-6))
     normalized_loss = loss / torch.clamp(running_std, min=0.5, max=5.0)
     
@@ -57,14 +46,7 @@ def adaptive_loss_scale(loss: torch.Tensor, momentum: float = 0.99) -> torch.Ten
 
 
 def pointer_loss(pointer_logits: torch.Tensor, target_account_idx: torch.Tensor, ignore_index: int = -1) -> torch.Tensor:
-    """
-    Pointer loss with variance normalization to reduce oscillations.
-    """
-    # Use the existing masked_sparse_ce function
     loss = masked_sparse_ce(pointer_logits, target_account_idx, ignore_index=ignore_index)
-    
-    # Add batch-wise variance normalization to stabilize training
-    # This reduces the high variance visible in training graphs
     return adaptive_loss_scale(loss)
 
 
@@ -84,11 +66,6 @@ def coverage_penalty(pointer_logits: torch.Tensor, max_total: float = 1.0, probs
 
 
 class SetF1Metric:
-    """
-    Approximate set-level F1 over (account, side) pairs ignoring order.
-    Uses greedy argmax decoding per step until STOP=1 in targets (or uses T steps if no explicit stop labels).
-    Not a torch.nn.Module; keeps running totals in torch tensors.
-    """
 
     def __init__(self, stop_id: int = 1) -> None:
         self.stop_id = stop_id
@@ -106,12 +83,12 @@ class SetF1Metric:
         target_sides: torch.Tensor,
         target_stop: Optional[torch.Tensor] = None,
     ) -> None:
-        pred_accounts = pointer_logits.argmax(dim=-1)  # [B, T]
-        pred_sides = side_logits.argmax(dim=-1)  # [B, T]
+        pred_accounts = pointer_logits.argmax(dim=-1)  
+        pred_sides = side_logits.argmax(dim=-1)  
 
         if target_stop is not None:
-            has_stop = (target_stop == self.stop_id).any(dim=-1)  # [B]
-            stop_idx = (target_stop == self.stop_id).int().argmax(dim=-1)  # [B]
+            has_stop = (target_stop == self.stop_id).any(dim=-1)  
+            stop_idx = (target_stop == self.stop_id).int().argmax(dim=-1)  
         else:
             B, T = pred_accounts.shape
             has_stop = torch.zeros((B,), dtype=torch.bool)
@@ -155,15 +132,11 @@ class SetF1Metric:
 
 
 class WindowedSetF1Metric:
-    """
-    Rolling window SetF1 over recent N steps.
-    Stores per-batch (tp, fp, fn) tuples and computes F1 from rolling sums.
-    """
 
     def __init__(self, window_size: int = 100, stop_id: int = 1) -> None:
         self.window_size = int(window_size)
         self.stop_id = stop_id
-        self.buffer = deque(maxlen=self.window_size)  # type: ignore[var-annotated]
+        self.buffer = deque(maxlen=self.window_size)  
 
     @torch.no_grad()
     def update_state(
@@ -174,13 +147,13 @@ class WindowedSetF1Metric:
         target_sides: torch.Tensor,
         target_stop: Optional[torch.Tensor] = None,
     ) -> None:
-        pred_accounts = pointer_logits.argmax(dim=-1)  # [B, T]
-        pred_sides = side_logits.argmax(dim=-1)  # [B, T]
+        pred_accounts = pointer_logits.argmax(dim=-1)  
+        pred_sides = side_logits.argmax(dim=-1)  
 
         B = pred_accounts.shape[0]
         if target_stop is not None:
-            has_stop = (target_stop == self.stop_id).any(dim=-1)  # [B]
-            stop_idx = (target_stop == self.stop_id).int().argmax(dim=-1)  # [B]
+            has_stop = (target_stop == self.stop_id).any(dim=-1)  
+            stop_idx = (target_stop == self.stop_id).int().argmax(dim=-1)  
         else:
             has_stop = torch.zeros((B,), dtype=torch.bool)
             stop_idx = torch.zeros((B,), dtype=torch.int64)
@@ -242,9 +215,9 @@ class SetF1Hungarian:
         target_stop: Optional[torch.Tensor] = None,
     ) -> None:
         try:
-            from scipy.optimize import linear_sum_assignment  # type: ignore
+            from scipy.optimize import linear_sum_assignment  
         except Exception:
-            return  # silently skip if SciPy unavailable
+            return  
 
         B, T, C = pointer_logits.shape
         for b in range(B):
@@ -270,7 +243,7 @@ class SetF1Hungarian:
             P = len(p_pairs)
             Tn = len(t_pairs)
             cost = torch.ones((P, Tn), dtype=torch.float32).numpy()
-            # zero cost where equal pairs
+            
             t_map = {}
             for j, tp in enumerate(t_pairs):
                 t_map.setdefault(tp, []).append(j)
@@ -297,7 +270,7 @@ class SetF1Hungarian:
 
 @torch.no_grad()
 def _pad_to_same_length(tensors: torch.Tensor, fill: float) -> torch.Tensor:
-    # Not used; kept for reference
+    
     return tensors
 
 
@@ -311,44 +284,30 @@ def flow_aux_loss(
     pointer_probs: Optional[torch.Tensor] = None,
     side_probs: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """
-    Align predicted per-side mass over accounts with normalized debit/credit amounts.
     
-    - pointer_logits: [B, T, C]
-    - side_logits: [B, T, 2]
-    - debit_indices: [B, D] (int64 indices into catalog; pad with -1)
-    - debit_weights: [B, D] (float; should sum to 1 per row; zeros if no debits)
-    - credit_indices: [B, K] (int64; pad with -1)
-    - credit_weights: [B, K] (float; sum to 1 per row; zeros if no credits)
-    - pointer_probs: Optional pre-computed softmax(pointer_logits, dim=-1)
-    - side_probs: Optional pre-computed softmax(side_logits, dim=-1)
+    p = pointer_probs if pointer_probs is not None else torch.softmax(pointer_logits, dim=-1)  
+    s = side_probs if side_probs is not None else torch.softmax(side_logits, dim=-1)  
     
-    Returns mean of per-side MSE across valid rows.
-    """
-    # Use pre-computed probabilities if provided, otherwise compute
-    p = pointer_probs if pointer_probs is not None else torch.softmax(pointer_logits, dim=-1)  # [B, T, C]
-    s = side_probs if side_probs is not None else torch.softmax(side_logits, dim=-1)  # [B, T, 2]
     
-    # Predicted mass per account for each side
-    pred_debit_mass = (s[:, :, 0].unsqueeze(-1) * p).sum(dim=1)  # [B, C]
-    pred_credit_mass = (s[:, :, 1].unsqueeze(-1) * p).sum(dim=1)  # [B, C]
+    pred_debit_mass = (s[:, :, 0].unsqueeze(-1) * p).sum(dim=1)  
+    pred_credit_mass = (s[:, :, 1].unsqueeze(-1) * p).sum(dim=1)  
     
     def side_mse(pred_mass: torch.Tensor, idxs: torch.Tensor, wts: torch.Tensor) -> torch.Tensor:
         idxs = idxs.clone()
         mask = (idxs >= 0).to(pred_mass.dtype)
         idxs_clamped = idxs.clamp(min=0)
-        gathered = torch.gather(pred_mass, 1, idxs_clamped)  # [B, L]
+        gathered = torch.gather(pred_mass, 1, idxs_clamped)  
         
-        # Normalize gathered predictions
+        
         sum_g = gathered.sum(dim=-1, keepdim=True) + 1e-8
         g_norm = torch.where(sum_g > 0, gathered / sum_g, torch.zeros_like(gathered))
         
-        # Normalize weights
+        
         wts = torch.where(mask > 0, wts, torch.zeros_like(wts))
         sum_w = wts.sum(dim=-1, keepdim=True) + 1e-8
         w_norm = torch.where(sum_w > 0, wts / sum_w, torch.zeros_like(wts))
         
-        mse = ((g_norm - w_norm) ** 2).mean(dim=-1)  # [B]
+        mse = ((g_norm - w_norm) ** 2).mean(dim=-1)  
         valid = (mask.sum(dim=-1) > 0).to(mse.dtype)
         return (mse * valid).sum() / (valid.sum() + 1e-6)
     

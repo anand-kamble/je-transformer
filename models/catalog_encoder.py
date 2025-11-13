@@ -9,17 +9,6 @@ from models.hash_utils import md5_to_bucket
 
 
 class CatalogEncoder(nn.Module):
-    """
-    Money-flow-aware account encoder (lightweight, hash-based).
-
-    Inputs: dict with Python lists of strings (length = num_accounts):
-      - number: account code like "502-0116"
-      - name: account name
-      - nature: e.g., "A","L","E","R","X" (asset/liability/...)
-
-    Produces: float32 tensor of shape [num_accounts, emb_dim]
-    """
-
     def __init__(
         self,
         emb_dim: int = 256,
@@ -35,7 +24,7 @@ class CatalogEncoder(nn.Module):
         self.name_hash_bins = int(name_hash_bins)
         self.nature_hash_bins = int(nature_hash_bins)
 
-        # Embeddings for hashed ids
+        
         self.code_emb = nn.Embedding(self.code_hash_bins, proj_dim)
         self.name_emb = nn.Embedding(self.name_hash_bins, proj_dim)
         self.nature_emb = nn.Embedding(self.nature_hash_bins, max(16, emb_dim // 8))

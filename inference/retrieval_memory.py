@@ -61,7 +61,7 @@ def embed_text(text: str, tokenizer_loc: str, encoder_loc: str, max_length: int 
 	desc = normalize_description(text)
 	tok = tokenizer([desc], padding=True, truncation=True, max_length=max_length, return_tensors="pt")
 	with torch.no_grad():
-		outputs = encoder(input_ids=tok["input_ids"], attention_mask=tok["attention_mask"])  # type: ignore[arg-type]
+		outputs = encoder(input_ids=tok["input_ids"], attention_mask=tok["attention_mask"])  
 		if use_cls:
 			pooled = outputs.last_hidden_state[:, 0, :]
 		else:
@@ -90,8 +90,8 @@ def build_retrieval_memory_for_text(
 	"""
 	searcher = load_searcher_from_gcs(index_dir)
 	ids = load_ids_from_gcs(ids_uri)
-	all_embs = load_embeddings_from_gcs(embeddings_uri)  # [N, H_enc]
-	q = embed_text(description, tokenizer_loc, encoder_loc, max_length=max_length, use_cls=use_cls)  # [H_enc]
+	all_embs = load_embeddings_from_gcs(embeddings_uri)  
+	q = embed_text(description, tokenizer_loc, encoder_loc, max_length=max_length, use_cls=use_cls)  
 	neighbors, _ = searcher.search(q, final_num_neighbors=top_k)
 	idxs = neighbors.tolist()
 	mem = all_embs[idxs] if len(idxs) > 0 else all_embs[:0]

@@ -8,18 +8,6 @@ import torch.nn.functional as F
 
 
 class PointerLayer(nn.Module):
-    """
-    Dot-product pointer over a catalog (with L2 normalization and optional mask).
-
-    forward(decoder_state, catalog_embeddings, mask=None) -> logits
-      - decoder_state: [batch, hidden]
-      - catalog_embeddings: [catalog_size, hidden] or [batch, catalog_size, hidden]
-      - mask: [catalog_size] or [batch, catalog_size], 1 for valid, 0 to mask
-
-    Returns:
-      - logits over catalog indices: [batch, catalog_size]
-    """
-
     def __init__(
         self,
         temperature: float = 1.0,
@@ -36,7 +24,7 @@ class PointerLayer(nn.Module):
             self.logit_scale = nn.Parameter(torch.tensor(float(scale_init), dtype=torch.float32))
             self._scale_learnable = True
         else:
-            # Non-persistent buffer so state_dict stays clean if not used
+            
             self.register_buffer("logit_scale", torch.tensor(float(scale_init), dtype=torch.float32), persistent=False)
             self._scale_learnable = False
 
@@ -46,19 +34,19 @@ class PointerLayer(nn.Module):
         catalog_embeddings: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        dec = decoder_state.to(dtype=torch.float32)  # [B, H]
-        cat = catalog_embeddings.to(dtype=torch.float32)  # [C, H] or [B, C, H]
+        dec = decoder_state.to(dtype=torch.float32)  
+        cat = catalog_embeddings.to(dtype=torch.float32)  
 
         if cat.dim() == 2:
-            # [C, H] -> [B, C, H]
+            
             cat = cat.unsqueeze(0).expand(dec.shape[0], -1, -1)
 
-        # Optional L2 normalize
+        
         if self.use_norm:
-            dec = F.normalize(dec, p=2.0, dim=-1)  # [B, H]
-            cat = F.normalize(cat, p=2.0, dim=-1)  # [B, C, H]
+            dec = F.normalize(dec, p=2.0, dim=-1)  
+            cat = F.normalize(cat, p=2.0, dim=-1)  
 
-        # Dot product -> [B, C]
+        
         logits = torch.einsum("bh,bch->bc", dec, cat)
         logits = torch.clamp(
             logits, 
@@ -66,7 +54,7 @@ class PointerLayer(nn.Module):
             max=self.logit_clip
         )
 
-        # Apply scale and temperature
+        
         logits = (self.logit_scale * logits) / self.temperature
 
         if mask is not None:
